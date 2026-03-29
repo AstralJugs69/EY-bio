@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import json
 import time
+import warnings
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -55,6 +56,12 @@ def configure_logging(level: int = logging.INFO) -> None:
     logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
     logging.getLogger("adlfs").setLevel(logging.WARNING)
     logging.getLogger("fsspec").setLevel(logging.WARNING)
+    logging.getLogger("matplotlib").setLevel(logging.WARNING)
+    warnings.filterwarnings(
+        "ignore",
+        message="Transparent hugepages are not enabled.*",
+        category=UserWarning,
+    )
 
 
 @contextmanager

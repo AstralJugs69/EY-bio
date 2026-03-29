@@ -5,6 +5,7 @@ import importlib.util
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -137,6 +138,12 @@ def _seasonal_mean(variable: xr.DataArray, season: str) -> xr.DataArray:
     return xr.full_like(variable.isel(time=0, drop=True), np.nan, dtype=np.float64)
 
 
+def _safe_ratio(numerator: xr.DataArray, denominator: xr.DataArray, epsilon: float = 1e-6) -> xr.DataArray:
+    import xarray as xr
+
+    return xr.where(np.abs(denominator) > epsilon, numerator / denominator, np.nan)
+
+
 def compute_feature_dataset(dataset: xr.Dataset, config: FeatureBuildConfig) -> xr.Dataset:
     import xarray as xr
 
@@ -176,6 +183,11 @@ def compute_feature_dataset(dataset: xr.Dataset, config: FeatureBuildConfig) -> 
 
         for season in SEASONS:
             feature_arrays[f"{variable_name}_{season.lower()}_mean"] = _seasonal_mean(variable, season)
+        seasonal_stack = xr.concat(
+            [feature_arrays[f"{variable_name}_{season.lower()}_mean"] for season in SEASONS],
+            dim="seasonal_stat",
+        )
+        feature_arrays[f"{variable_name}_seasonal_amp"] = seasonal_stack.max(axis=0) - seasonal_stack.min(axis=0)
 
         median_surface = feature_arrays[f"{variable_name}_median"]
         rolling = median_surface.rolling(
@@ -186,6 +198,39 @@ def compute_feature_dataset(dataset: xr.Dataset, config: FeatureBuildConfig) -> 
         )
         feature_arrays[f"{variable_name}_local_mean"] = rolling.mean()
         feature_arrays[f"{variable_name}_local_std"] = rolling.std()
+        feature_arrays[f"{variable_name}_cv"] = _safe_ratio(
+            feature_arrays[f"{variable_name}_std"],
+            np.abs(feature_arrays[f"{variable_name}_mean"]) + 1e-6,
+        )
+
+    # Bioclim-style proxies derived from TerraClimate monthly series.
+    diurnal_range = dataset["tmax"] - dataset["tmin"]
+    feature_arrays["bio_mean_diurnal_range"] = diurnal_range.mean(dim="time", skipna=True)
+    feature_arrays["bio_temp_annual_range"] = dataset["tmax"].max(dim="time", skipna=True) - dataset["tmin"].min(
+        dim="time", skipna=True
+    )
+    feature_arrays["bio_isothermality_proxy"] = _safe_ratio(
+        feature_arrays["bio_mean_diurnal_range"],
+        feature_arrays["bio_temp_annual_range"],
+    )
+
+    ppt_rolling3_sum = dataset["ppt"].rolling(time=3, min_periods=3).sum()
+    tmax_rolling3_mean = dataset["tmax"].rolling(time=3, min_periods=3).mean()
+    tmin_rolling3_mean = dataset["tmin"].rolling(time=3, min_periods=3).mean()
+    soil_rolling3_mean = dataset["soil"].rolling(time=3, min_periods=3).mean()
+    water_balance = dataset["ppt"] - dataset["pet"]
+
+    feature_arrays["bio_annual_ppt_total"] = dataset["ppt"].sum(dim="time", skipna=True)
+    feature_arrays["bio_wettest_quarter_ppt"] = ppt_rolling3_sum.max(dim="time", skipna=True)
+    feature_arrays["bio_driest_quarter_ppt"] = ppt_rolling3_sum.min(dim="time", skipna=True)
+    feature_arrays["bio_warmest_quarter_tmax"] = tmax_rolling3_mean.max(dim="time", skipna=True)
+    feature_arrays["bio_coldest_quarter_tmin"] = tmin_rolling3_mean.min(dim="time", skipna=True)
+    feature_arrays["bio_wettest_quarter_soil"] = soil_rolling3_mean.max(dim="time", skipna=True)
+    feature_arrays["bio_driest_quarter_soil"] = soil_rolling3_mean.min(dim="time", skipna=True)
+    feature_arrays["bio_water_balance_total"] = water_balance.sum(dim="time", skipna=True)
+    feature_arrays["bio_water_balance_last6"] = water_balance.isel(time=slice(-config.last_n_months, None)).sum(
+        dim="time", skipna=True
+    )
 
     feature_dataset = xr.Dataset(feature_arrays)
     LOGGER.info("Completed feature grid generation | feature_count=%s", len(feature_dataset.data_vars))
@@ -198,13 +243,16 @@ def sample_feature_dataset(feature_dataset: xr.Dataset, points_frame: pd.DataFra
     LOGGER.info("Sampling feature grids at %s point locations", points_frame.shape[0])
     lat_indexer = xr.DataArray(points_frame["Latitude"].to_numpy(), dims="point")
     lon_indexer = xr.DataArray(points_frame["Longitude"].to_numpy(), dims="point")
-    sampled = feature_dataset.sel(lat=lat_indexer, lon=lon_indexer, method="nearest").load()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="All-NaN slice encountered", category=RuntimeWarning)
+        warnings.filterwarnings("ignore", message="invalid value encountered in divide", category=RuntimeWarning)
+        sampled = feature_dataset.sel(lat=lat_indexer, lon=lon_indexer, method="nearest").load()
     sampled_columns = {
         name: np.asarray(data_array.values).reshape(-1)
         for name, data_array in sampled.data_vars.items()
     }
     sampled_frame = pd.DataFrame(sampled_columns, index=points_frame.index)
-    return sampled_frame.applymap(coerce_native)
+    return sampled_frame.apply(lambda column: column.map(coerce_native))
 
 
 def _drop_all_null_feature_columns(
@@ -245,13 +293,19 @@ def build_feature_artifacts(config: FeatureBuildConfig) -> FeatureArtifacts:
     LOGGER.info("Prepared unique coordinate set | rows=%s", coordinate_frame.shape[0])
 
     dataset = open_terraclimate_dataset(config)
-    with log_step(LOGGER, "Compute TerraClimate feature dataset"):
-        feature_dataset = compute_feature_dataset(dataset, config)
-    with log_step(LOGGER, "Sample features at coordinates", coordinate_rows=coordinate_frame.shape[0]):
-        sampled_coordinates = pd.concat(
-            [coordinate_frame, sample_feature_dataset(feature_dataset, coordinate_frame)],
-            axis=1,
-        )
+    try:
+        with log_step(LOGGER, "Compute TerraClimate feature dataset"):
+            feature_dataset = compute_feature_dataset(dataset, config)
+        try:
+            with log_step(LOGGER, "Sample features at coordinates", coordinate_rows=coordinate_frame.shape[0]):
+                sampled_coordinates = pd.concat(
+                    [coordinate_frame, sample_feature_dataset(feature_dataset, coordinate_frame)],
+                    axis=1,
+                )
+        finally:
+            feature_dataset.close()
+    finally:
+        dataset.close()
 
     train_features = train_df.merge(
         sampled_coordinates,

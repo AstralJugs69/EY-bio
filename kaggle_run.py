@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from baseline_models import finalize_submission
+from frog_challenge.bootstrap import ensure_feature_artifacts
 from frog_challenge.config import FeatureBuildConfig, ModelConfig, TPUConfig
 from frog_challenge.features import build_feature_artifacts
 from frog_challenge.modeling import run_baseline_suite
@@ -49,11 +50,18 @@ def main() -> int:
         return 0
 
     if args.stage == "baseline":
+        ensure_feature_artifacts(args.feature_dir, args.data_root, train_path=train_path, test_path=test_path)
         artifacts = run_baseline_suite(
             ModelConfig(
                 feature_dir=args.feature_dir,
                 output_dir=args.baseline_dir,
             )
+        )
+        final_choice = finalize_submission(
+            feature_dir=args.feature_dir,
+            output_dir=args.baseline_dir,
+            tpu_artifact_dir=args.tpu_artifact_dir,
+            baseline_artifacts=artifacts,
         )
         print(
             json.dumps(
@@ -62,6 +70,7 @@ def main() -> int:
                     "submission_path": str(artifacts.submission_path),
                     "best_model_name": artifacts.best_model_name,
                     "best_oof_f1": artifacts.best_oof_f1,
+                    "final_choice": final_choice,
                 },
                 indent=2,
             )
@@ -69,6 +78,7 @@ def main() -> int:
         return 0
 
     if args.stage == "tpu":
+        ensure_feature_artifacts(args.feature_dir, args.data_root, train_path=train_path, test_path=test_path)
         artifacts = run_tpu_suite(
             TPUConfig(
                 feature_dir=args.feature_dir,
@@ -78,18 +88,25 @@ def main() -> int:
                 patience=args.patience,
             )
         )
+        final_choice = finalize_submission(
+            feature_dir=args.feature_dir,
+            output_dir=args.baseline_dir,
+            tpu_artifact_dir=args.tpu_dir,
+        )
         print(
             json.dumps(
                 {
                     "summary_path": str(artifacts.summary_path),
                     "best_model_name": artifacts.best_model_name,
                     "best_oof_f1": artifacts.best_oof_f1,
+                    "final_choice": final_choice,
                 },
                 indent=2,
             )
         )
         return 0
 
+    ensure_feature_artifacts(args.feature_dir, args.data_root, train_path=train_path, test_path=test_path)
     final_choice = finalize_submission(
         feature_dir=args.feature_dir,
         output_dir=args.baseline_dir,

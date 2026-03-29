@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from frog_challenge.bootstrap import ensure_feature_artifacts
 from frog_challenge.config import ModelConfig
 from frog_challenge.modeling import ModelRunArtifacts, load_feature_tables, run_baseline_suite
 from frog_challenge.tpu import predict_saved_tpu_ensemble
@@ -13,6 +14,7 @@ from frog_challenge.utils import ensure_directory, read_json, write_json
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train CPU baseline models for the EY frog challenge.")
+    parser.add_argument("--data-root", type=Path, default=Path("."))
     parser.add_argument("--feature-dir", type=Path, default=Path("artifacts/features"))
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts/baselines"))
     parser.add_argument("--tpu-artifact-dir", type=Path, default=None)
@@ -94,6 +96,7 @@ def finalize_submission(
 
 def main() -> int:
     args = parse_args()
+    ensure_feature_artifacts(args.feature_dir, args.data_root)
     config = ModelConfig(
         feature_dir=args.feature_dir,
         output_dir=args.output_dir,

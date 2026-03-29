@@ -1,32 +1,35 @@
 # EY Frog Challenge Pipeline
 
-This workspace now includes a Kaggle-ready implementation for the EY Biodiversity frog challenge:
+This repo contains a Kaggle-ready implementation for the EY Biodiversity frog challenge. The challenge CSV files are already committed here, so the Kaggle notebooks can clone the repo and bootstrap themselves without separate data uploads.
 
-- `kaggle_run.py`: unified stage dispatcher for Kaggle launcher notebooks.
-- `feature_build.py`: CPU notebook/script entrypoint for TerraClimate feature extraction.
-- `baseline_models.py`: CPU notebook/script entrypoint for spatial cross-validation baselines and optional CPU-side final selection against TPU artifacts.
-- `tpu_train.py`: TPU notebook/script entrypoint for neural tabular training only.
-- `frog_challenge/`: shared reusable code for feature engineering, baseline modeling, and TPU training.
-- `notebooks/`: one GitHub launcher notebook plus three thin stage-specific notebooks.
+## What is here
 
-## Recommended Kaggle workflow
+- `kaggle_run.py`: unified stage dispatcher used by the launcher notebook
+- `feature_build.py`: TerraClimate feature extraction entrypoint
+- `baseline_models.py`: CPU baseline training plus final submission selection
+- `tpu_train.py`: TPU neural training entrypoint
+- `frog_challenge/`: shared feature, modeling, TPU, and bootstrap code
+- `notebooks/`: self-bootstrapping Kaggle notebooks
 
-1. Push this repo to GitHub.
-2. Copy [notebooks/00_kaggle_github_launcher.ipynb](<C:/dev/data/dataset/ZIndi/EY bio/notebooks/00_kaggle_github_launcher.ipynb>) into Kaggle once.
-3. Set `GITHUB_REPO`, `GITHUB_REF`, and `STAGE` in the launcher notebook.
-4. Run the launcher notebook. It clones the latest repo ref into `/kaggle/working`, installs `requirements-kaggle.txt`, and executes `kaggle_run.py`.
-5. For private repos, store a read-only `GITHUB_TOKEN` in Kaggle Secrets.
-6. Use `main` while iterating, then pin `GITHUB_REF` to a commit SHA when you want a reproducible run.
+## Easiest Kaggle start
 
-The detailed workflow is documented in [docs/KAGGLE_GITHUB_WORKFLOW.md](<C:/dev/data/dataset/ZIndi/EY bio/docs/KAGGLE_GITHUB_WORKFLOW.md>).
+Use one of these notebooks directly on Kaggle with internet enabled:
 
-## Manual stage notebooks
-
-If you still want separate notebooks per stage, the existing stage notebooks remain available:
-
-- `notebooks/01_feature_build_kaggle.ipynb`
 - `notebooks/02_baseline_models_kaggle.ipynb`
+  - CPU runtime
+  - Clones the repo
+  - Builds features if needed from repo-local CSVs
+  - Trains CPU baselines
+  - Writes `artifacts/baselines/final_submission.csv`
 - `notebooks/03_tpu_train_kaggle.ipynb`
+  - TPU runtime
+  - Clones the repo
+  - Builds features if needed from repo-local CSVs
+  - Trains TPU neural models
+  - Runs CPU baselines in the same session
+  - Writes `artifacts/baselines/final_submission.csv`
+
+If you want a generic dispatcher notebook instead, use `notebooks/00_kaggle_github_launcher.ipynb`.
 
 ## Artifact layout
 
@@ -36,7 +39,8 @@ If you still want separate notebooks per stage, the existing stage notebooks rem
   - `feature_manifest.json`
 - `artifacts/baselines/`
   - `baseline_summary.json`
-  - `submission.csv`
+  - `final_selection.json`
+  - `final_submission.csv`
   - `models/*.parquet`
 - `artifacts/tpu/`
   - `tpu_summary.json`
@@ -47,5 +51,5 @@ If you still want separate notebooks per stage, the existing stage notebooks rem
 ## Notes
 
 - Latitude and longitude are used only for TerraClimate lookup and spatial grouping.
-- The feature tables keep coordinate columns for traceability, but the modeling code excludes them from the model matrix.
-- CPU baselines remain the control path. TPU models are only for faster neural training experiments.
+- The modeling code excludes `ID`, `Latitude`, `Longitude`, and `spatial_group` from the learned feature matrix.
+- CPU baselines remain the control path. TPU is only used to accelerate neural training experiments.

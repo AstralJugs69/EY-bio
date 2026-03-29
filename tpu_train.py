@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from frog_challenge.bootstrap import ensure_feature_artifacts
 from frog_challenge.config import TPUConfig
 from frog_challenge.tpu import run_tpu_suite
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train TPU neural models for the EY frog challenge.")
+    parser.add_argument("--data-root", type=Path, default=Path("."))
     parser.add_argument("--feature-dir", type=Path, default=Path("artifacts/features"))
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts/tpu"))
     parser.add_argument("--batch-size", type=int, default=256)
@@ -19,6 +21,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    ensure_feature_artifacts(args.feature_dir, args.data_root)
     config = TPUConfig(
         feature_dir=args.feature_dir,
         output_dir=args.output_dir,

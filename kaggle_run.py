@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 
 from baseline_models import finalize_submission
@@ -10,6 +11,9 @@ from frog_challenge.config import FeatureBuildConfig, ModelConfig, TPUConfig
 from frog_challenge.features import build_feature_artifacts
 from frog_challenge.modeling import run_baseline_suite
 from frog_challenge.tpu import run_tpu_suite
+from frog_challenge.utils import configure_logging
+
+LOGGER = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,8 +39,17 @@ def resolve_data_paths(args: argparse.Namespace) -> tuple[Path, Path]:
 
 
 def main() -> int:
+    configure_logging()
     args = parse_args()
     train_path, test_path = resolve_data_paths(args)
+    LOGGER.info(
+        "Kaggle runner starting | stage=%s | data_root=%s | feature_dir=%s | baseline_dir=%s | tpu_dir=%s",
+        args.stage,
+        args.data_root,
+        args.feature_dir,
+        args.baseline_dir,
+        args.tpu_dir,
+    )
 
     if args.stage == "feature":
         artifacts = build_feature_artifacts(
@@ -75,6 +88,7 @@ def main() -> int:
                 indent=2,
             )
         )
+        LOGGER.info("Kaggle runner finished baseline stage")
         return 0
 
     if args.stage == "tpu":
@@ -104,6 +118,7 @@ def main() -> int:
                 indent=2,
             )
         )
+        LOGGER.info("Kaggle runner finished tpu stage")
         return 0
 
     ensure_feature_artifacts(args.feature_dir, args.data_root, train_path=train_path, test_path=test_path)
@@ -113,6 +128,7 @@ def main() -> int:
         tpu_artifact_dir=args.tpu_artifact_dir or args.tpu_dir,
     )
     print(json.dumps(final_choice, indent=2))
+    LOGGER.info("Kaggle runner finished finalize stage")
     return 0
 
 

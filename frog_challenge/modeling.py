@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 from typing import Callable
 
@@ -15,10 +16,11 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MinMaxScaler
 
 from .config import ModelConfig
-from .utils import ensure_directory, read_dataframe_parquet, read_json, write_dataframe_parquet, write_json
+from .utils import ensure_directory, log_step, read_dataframe_parquet, read_json, write_dataframe_parquet, write_json
 
 
 EstimatorFactory = Callable[[], object]
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -31,9 +33,16 @@ class ModelRunArtifacts:
 
 
 def load_feature_tables(feature_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
+    LOGGER.info("Loading feature tables from %s", feature_dir)
     train_features = read_dataframe_parquet(feature_dir / "train_features.parquet")
     test_features = read_dataframe_parquet(feature_dir / "test_features.parquet")
     manifest = read_json(feature_dir / "feature_manifest.json")
+    LOGGER.info(
+        "Loaded feature tables | train_rows=%s | test_rows=%s | feature_count=%s",
+        train_features.shape[0],
+        test_features.shape[0],
+        len(manifest.get("feature_columns", [])),
+    )
     return train_features, test_features, manifest
 
 
@@ -188,9 +197,11 @@ def reproduce_random_split_benchmark(
         random_state=random_state,
     )
     pipeline = _logistic_factory(random_state)()
+    LOGGER.info("Running random-split benchmark reproduction on features %s", benchmark_features)
     pipeline.fit(X_train, y_train)
     predictions = pipeline.predict(X_valid)
     score = f1_score(y_valid, predictions)
+    LOGGER.info("Benchmark reproduction finished | random_split_f1=%.4f", score)
     return {"benchmark_features": benchmark_features, "random_split_f1": float(score)}
 
 
@@ -214,6 +225,14 @@ def _run_cross_validated_model(
     X_test = test_frame[feature_columns]
 
     for fold_index, (train_index, valid_index) in enumerate(splitter.split(X, y, groups=groups), start=1):
+        LOGGER.info(
+            "Model %s | fold %s/%s | train_rows=%s | valid_rows=%s",
+            model_name,
+            fold_index,
+            config.n_splits,
+            len(train_index),
+            len(valid_index),
+        )
         estimator = estimator_factory()
         X_train_fold = X.iloc[train_index]
         y_train_fold = y[train_index]
@@ -235,6 +254,12 @@ def _run_cross_validated_model(
                 "f1_at_0_50": float(f1_score(y_valid_fold, (valid_probabilities >= 0.50).astype(int))),
             }
         )
+        LOGGER.info(
+            "Model %s | fold %s complete | f1_at_0_50=%.4f",
+            model_name,
+            fold_index,
+            fold_rows[-1]["f1_at_0_50"],
+        )
 
     threshold, oof_f1 = optimize_threshold(
         y_true=y,
@@ -244,6 +269,12 @@ def _run_cross_validated_model(
         threshold_step=config.optimize_threshold_step,
     )
     mean_test_probability = np.mean(np.vstack(test_fold_probabilities), axis=0)
+    LOGGER.info(
+        "Model %s complete | optimized_threshold=%.2f | oof_f1=%.4f",
+        model_name,
+        threshold,
+        oof_f1,
+    )
 
     return {
         "model_name": model_name,
@@ -283,6 +314,12 @@ def run_baseline_suite(config: ModelConfig) -> ModelRunArtifacts:
     output_dir = ensure_directory(config.output_dir)
     train_frame, test_frame, manifest = load_feature_tables(config.feature_dir)
     feature_columns = select_feature_columns(train_frame, config.protected_columns)
+    LOGGER.info(
+        "Starting CPU baseline suite | output_dir=%s | feature_count=%s | n_splits=%s",
+        output_dir,
+        len(feature_columns),
+        config.n_splits,
+    )
     benchmark = reproduce_random_split_benchmark(train_frame, config.target_column, config.random_state)
 
     splitter = StratifiedGroupKFold(n_splits=config.n_splits, shuffle=True, random_state=config.random_state)
@@ -291,17 +328,18 @@ def run_baseline_suite(config: ModelConfig) -> ModelRunArtifacts:
     y_true = train_frame[config.target_column].to_numpy()
 
     for model_name, estimator_factory in get_baseline_model_factories(config.random_state).items():
-        model_outputs[model_name] = _run_cross_validated_model(
-            model_name=model_name,
-            estimator_factory=estimator_factory,
-            train_frame=train_frame,
-            test_frame=test_frame,
-            feature_columns=feature_columns,
-            target_column=config.target_column,
-            splitter=splitter,
-            groups=groups,
-            config=config,
-        )
+        with log_step(LOGGER, f"Train baseline model {model_name}"):
+            model_outputs[model_name] = _run_cross_validated_model(
+                model_name=model_name,
+                estimator_factory=estimator_factory,
+                train_frame=train_frame,
+                test_frame=test_frame,
+                feature_columns=feature_columns,
+                target_column=config.target_column,
+                splitter=splitter,
+                groups=groups,
+                config=config,
+            )
 
     sorted_models = sorted(model_outputs.values(), key=lambda item: item["oof_f1"], reverse=True)
     candidate_outputs = dict(model_outputs)
@@ -321,6 +359,12 @@ def run_baseline_suite(config: ModelConfig) -> ModelRunArtifacts:
             )
 
     best_name, best_output = max(candidate_outputs.items(), key=lambda item: float(item[1]["oof_f1"]))
+    LOGGER.info(
+        "Best baseline candidate selected | name=%s | oof_f1=%.4f | threshold=%.2f",
+        best_name,
+        best_output["oof_f1"],
+        best_output["threshold"],
+    )
 
     model_dir = ensure_directory(output_dir / "models")
     for name, output in model_outputs.items():
@@ -377,6 +421,11 @@ def run_baseline_suite(config: ModelConfig) -> ModelRunArtifacts:
 
     summary_path = output_dir / "baseline_summary.json"
     write_json(summary_path, summary)
+    LOGGER.info(
+        "Baseline suite finished | summary=%s | submission=%s",
+        summary_path,
+        submission_path,
+    )
     return ModelRunArtifacts(
         summary_path=summary_path,
         submission_path=submission_path,

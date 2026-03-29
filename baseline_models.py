@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
 
 import pandas as pd
@@ -9,7 +10,9 @@ from frog_challenge.bootstrap import ensure_feature_artifacts
 from frog_challenge.config import ModelConfig
 from frog_challenge.modeling import ModelRunArtifacts, load_feature_tables, run_baseline_suite
 from frog_challenge.tpu import predict_saved_tpu_ensemble
-from frog_challenge.utils import ensure_directory, read_json, write_json
+from frog_challenge.utils import configure_logging, ensure_directory, read_json, write_json
+
+LOGGER = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,6 +58,12 @@ def finalize_submission(
     baseline_artifacts: ModelRunArtifacts | None = None,
 ) -> dict[str, object]:
     output_dir = ensure_directory(output_dir)
+    LOGGER.info(
+        "Finalizing submission | feature_dir=%s | output_dir=%s | tpu_artifact_dir=%s",
+        feature_dir,
+        output_dir,
+        tpu_artifact_dir,
+    )
     if baseline_artifacts is None:
         if (output_dir / "baseline_summary.json").exists():
             baseline_artifacts = _load_baseline_artifacts(output_dir)
@@ -79,6 +88,11 @@ def finalize_submission(
     if tpu_artifact_dir is not None and tpu_artifact_dir.exists():
         tpu_summary = read_json(tpu_artifact_dir / "tpu_summary.json")
         if float(tpu_summary["best_oof_f1"]) > float(baseline_summary["best_oof_f1"]):
+            LOGGER.info(
+                "TPU artifacts beat baseline locally | baseline_oof_f1=%.4f | tpu_oof_f1=%.4f",
+                float(baseline_summary["best_oof_f1"]),
+                float(tpu_summary["best_oof_f1"]),
+            )
             probabilities, threshold, tpu_summary = predict_saved_tpu_ensemble(tpu_artifact_dir, test_frame)
             _write_final_submission(test_frame["ID"], probabilities, threshold, final_submission_path)
             final_choice = {
@@ -89,13 +103,28 @@ def finalize_submission(
                 "best_oof_f1": float(tpu_summary["best_oof_f1"]),
                 "best_threshold": float(tpu_summary["best_threshold"]),
             }
+        else:
+            LOGGER.info(
+                "Keeping baseline submission | baseline_oof_f1=%.4f | tpu_oof_f1=%.4f",
+                float(baseline_summary["best_oof_f1"]),
+                float(tpu_summary["best_oof_f1"]),
+            )
 
     write_json(output_dir / "final_selection.json", final_choice)
+    LOGGER.info("Final selection written | choice=%s", final_choice)
     return final_choice
 
 
 def main() -> int:
+    configure_logging()
     args = parse_args()
+    LOGGER.info(
+        "Baseline entrypoint starting | data_root=%s | feature_dir=%s | output_dir=%s | tpu_artifact_dir=%s",
+        args.data_root,
+        args.feature_dir,
+        args.output_dir,
+        args.tpu_artifact_dir,
+    )
     ensure_feature_artifacts(args.feature_dir, args.data_root)
     config = ModelConfig(
         feature_dir=args.feature_dir,
@@ -108,6 +137,7 @@ def main() -> int:
         tpu_artifact_dir=args.tpu_artifact_dir,
         baseline_artifacts=baseline_artifacts,
     )
+    LOGGER.info("Baseline entrypoint finished")
     return 0
 
 

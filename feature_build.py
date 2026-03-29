@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 
 from frog_challenge.config import FeatureBuildConfig
 from frog_challenge.features import build_feature_artifacts
+from frog_challenge.utils import configure_logging
+
+LOGGER = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,7 +27,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    configure_logging()
     args = parse_args()
+    LOGGER.info(
+        "Feature build entrypoint starting | train=%s | test=%s | output_dir=%s",
+        args.train_path,
+        args.test_path,
+        args.output_dir,
+    )
     config = FeatureBuildConfig(
         train_path=args.train_path,
         test_path=args.test_path,
@@ -36,6 +47,7 @@ def main() -> int:
         max_lat=args.max_lat,
     )
     artifacts = build_feature_artifacts(config)
+    LOGGER.info("Feature build complete | artifacts=%s", artifacts.to_dict())
     print(json.dumps(artifacts.to_dict(), indent=2))
     return 0
 

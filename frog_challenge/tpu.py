@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 
 import joblib
@@ -15,8 +16,9 @@ from sklearn.utils.class_weight import compute_class_weight
 
 from .config import TPUConfig
 from .modeling import load_feature_tables, optimize_threshold, select_feature_columns
-from .utils import ensure_directory, read_json, write_dataframe_parquet, write_json
+from .utils import ensure_directory, log_step, read_json, write_dataframe_parquet, write_json
 
+LOGGER = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class TPURunArtifacts:
@@ -130,6 +132,14 @@ def _fit_single_architecture(
     preprocessor_dir = ensure_directory(config.output_dir / "preprocessors" / architecture)
 
     for fold_index, (train_index, valid_index) in enumerate(splitter.split(X, y, groups=groups), start=1):
+        LOGGER.info(
+            "TPU architecture %s | fold %s/%s | train_rows=%s | valid_rows=%s",
+            architecture,
+            fold_index,
+            config.n_splits,
+            len(train_index),
+            len(valid_index),
+        )
         tf.keras.backend.clear_session()
         tf.keras.utils.set_random_seed(config.random_state + fold_index)
 
@@ -183,6 +193,13 @@ def _fit_single_architecture(
                 "f1_at_0_50": float(f1_score(y_valid_fold.astype(int), (valid_probabilities >= 0.50).astype(int))),
             }
         )
+        LOGGER.info(
+            "TPU architecture %s | fold %s complete | best_epoch=%s | f1_at_0_50=%.4f",
+            architecture,
+            fold_index,
+            fold_rows[-1]["best_epoch"],
+            fold_rows[-1]["f1_at_0_50"],
+        )
 
         if config.save_fold_models:
             model.save(model_dir / f"fold_{fold_index}.keras")
@@ -195,6 +212,12 @@ def _fit_single_architecture(
         threshold_min=config.optimize_threshold_min,
         threshold_max=config.optimize_threshold_max,
         threshold_step=config.optimize_threshold_step,
+    )
+    LOGGER.info(
+        "TPU architecture %s complete | optimized_threshold=%.2f | oof_f1=%.4f",
+        architecture,
+        threshold,
+        oof_f1,
     )
 
     return {
@@ -232,17 +255,25 @@ def run_tpu_suite(config: TPUConfig) -> TPURunArtifacts:
     y_true = train_frame[config.target_column].to_numpy().astype(int)
 
     tf, strategy, accelerator = create_tpu_strategy()
+    LOGGER.info(
+        "Starting TPU suite | accelerator=%s | output_dir=%s | feature_count=%s | architectures=%s",
+        accelerator,
+        output_dir,
+        len(feature_columns),
+        list(config.architectures),
+    )
     architecture_outputs: dict[str, dict[str, object]] = {}
     for architecture in config.architectures:
-        architecture_outputs[architecture] = _fit_single_architecture(
-            tf=tf,
-            strategy=strategy,
-            architecture=architecture,
-            config=config,
-            train_frame=train_frame,
-            test_frame=test_frame,
-            feature_columns=feature_columns,
-        )
+        with log_step(LOGGER, f"Train TPU architecture {architecture}"):
+            architecture_outputs[architecture] = _fit_single_architecture(
+                tf=tf,
+                strategy=strategy,
+                architecture=architecture,
+                config=config,
+                train_frame=train_frame,
+                test_frame=test_frame,
+                feature_columns=feature_columns,
+            )
 
     candidates = dict(architecture_outputs)
     if len(architecture_outputs) >= 2:
@@ -254,6 +285,12 @@ def run_tpu_suite(config: TPUConfig) -> TPURunArtifacts:
         candidates[ensemble_name] = _candidate_record(ensemble_name, ensemble_oof, ensemble_test, y_true, config)
 
     best_name, best_output = max(candidates.items(), key=lambda item: float(item[1]["oof_f1"]))
+    LOGGER.info(
+        "Best TPU candidate selected | name=%s | oof_f1=%.4f | threshold=%.2f",
+        best_name,
+        best_output["oof_f1"],
+        best_output["threshold"],
+    )
 
     predictions_dir = ensure_directory(output_dir / "predictions")
     for name, output in architecture_outputs.items():
@@ -305,6 +342,7 @@ def run_tpu_suite(config: TPUConfig) -> TPURunArtifacts:
             "best_oof_f1": float(best_output["oof_f1"]),
         },
     )
+    LOGGER.info("TPU suite finished | summary=%s", summary_path)
 
     return TPURunArtifacts(
         summary_path=summary_path,

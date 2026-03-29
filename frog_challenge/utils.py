@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 import json
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -39,3 +42,23 @@ def coerce_native(value: Any) -> Any:
         except Exception:
             return value
     return value
+
+
+def configure_logging(level: int = logging.INFO) -> None:
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+
+
+@contextmanager
+def log_step(logger: logging.Logger, label: str, **details: Any):
+    suffix = f" | details={json.dumps(details, default=str, sort_keys=True)}" if details else ""
+    logger.info("START %s%s", label, suffix)
+    started_at = time.perf_counter()
+    try:
+        yield
+    finally:
+        logger.info("DONE %s | elapsed=%.1fs", label, time.perf_counter() - started_at)

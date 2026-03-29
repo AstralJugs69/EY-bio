@@ -37,7 +37,7 @@ class FeatureBuildConfig:
     max_lat: float = -30.92
     variables: tuple[str, ...] = TERRACLIMATE_VARIABLES
     last_n_months: int = 6
-    neighborhood_size: int = 3
+    neighborhood_sizes: tuple[int, ...] = (3, 5, 7)
     quantiles: tuple[float, float] = (0.10, 0.90)
     spatial_group_size_degrees: float = 0.5
 
@@ -54,6 +54,11 @@ class ModelConfig:
     optimize_threshold_min: float = 0.10
     optimize_threshold_max: float = 0.90
     optimize_threshold_step: float = 0.01
+    negative_bagging_bags: int = 5
+    negative_bagging_models: tuple[str, ...] = ("extra_trees", "xgboost")
+    negative_bagging_negative_fraction: float = 1.0
+    stacking_models: tuple[str, ...] = ("logistic_regression", "hist_gradient_boosting")
+    stacking_top_k: int = 5
     protected_columns: tuple[str, ...] = (
         "ID",
         "Latitude",

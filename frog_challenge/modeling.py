@@ -110,10 +110,13 @@ def _hist_gradient_factory(random_state: int) -> EstimatorFactory:
                 (
                     "classifier",
                     HistGradientBoostingClassifier(
-                        learning_rate=0.05,
-                        max_depth=6,
-                        max_iter=500,
-                        min_samples_leaf=20,
+                        learning_rate=0.03,
+                        max_depth=None,
+                        max_iter=900,
+                        max_leaf_nodes=63,
+                        l2_regularization=0.1,
+                        min_samples_leaf=10,
+                        max_bins=255,
                         random_state=random_state,
                     ),
                 ),
@@ -131,9 +134,11 @@ def _extra_trees_factory(random_state: int) -> EstimatorFactory:
                 (
                     "classifier",
                     ExtraTreesClassifier(
-                        n_estimators=600,
+                        n_estimators=1200,
                         max_depth=None,
-                        min_samples_leaf=2,
+                        min_samples_leaf=1,
+                        max_features=0.6,
+                        bootstrap=True,
                         class_weight="balanced_subsample",
                         n_jobs=-1,
                         random_state=random_state,
@@ -155,9 +160,12 @@ def _catboost_factory(random_state: int) -> EstimatorFactory | None:
         return CatBoostClassifier(
             loss_function="Logloss",
             eval_metric="F1",
-            iterations=800,
-            depth=6,
-            learning_rate=0.03,
+            iterations=1200,
+            depth=7,
+            learning_rate=0.025,
+            l2_leaf_reg=5.0,
+            bagging_temperature=0.5,
+            random_strength=1.0,
             random_seed=random_state,
             auto_class_weights="Balanced",
             verbose=False,
@@ -176,13 +184,14 @@ def _xgboost_factory(random_state: int) -> EstimatorFactory | None:
         return XGBClassifier(
             objective="binary:logistic",
             eval_metric="logloss",
-            n_estimators=900,
-            max_depth=6,
-            learning_rate=0.03,
-            subsample=0.85,
-            colsample_bytree=0.85,
+            n_estimators=1400,
+            max_depth=5,
+            learning_rate=0.02,
+            subsample=0.90,
+            colsample_bytree=0.80,
             min_child_weight=2,
-            reg_lambda=1.5,
+            reg_lambda=2.0,
+            reg_alpha=0.1,
             random_state=random_state,
             tree_method="hist",
             n_jobs=-1,
@@ -315,6 +324,128 @@ def _run_cross_validated_model(
     }
 
 
+def _sample_negative_bag(
+    train_fold: pd.DataFrame,
+    target_column: str,
+    rng: np.random.Generator,
+    negative_fraction: float,
+) -> pd.DataFrame:
+    positives = train_fold[train_fold[target_column] == 1]
+    negatives = train_fold[train_fold[target_column] == 0]
+    if negatives.empty:
+        return train_fold
+
+    negative_sample_size = max(1, int(round(len(negatives) * negative_fraction)))
+    sampled_negatives = negatives.iloc[
+        rng.choice(len(negatives), size=negative_sample_size, replace=True)
+    ]
+    bagged = (
+        pd.concat([positives, sampled_negatives], axis=0)
+        .sample(frac=1.0, random_state=int(rng.integers(0, 1_000_000_000)))
+        .reset_index(drop=True)
+    )
+    return bagged
+
+
+def _run_negative_bagged_model(
+    model_name: str,
+    estimator_factory: EstimatorFactory,
+    train_frame: pd.DataFrame,
+    test_frame: pd.DataFrame,
+    feature_columns: list[str],
+    target_column: str,
+    splitter: StratifiedGroupKFold,
+    groups: pd.Series,
+    config: ModelConfig,
+) -> dict[str, object]:
+    oof_probabilities = np.zeros(train_frame.shape[0], dtype=np.float64)
+    test_fold_probabilities: list[np.ndarray] = []
+    fold_rows: list[dict[str, float | int]] = []
+    X_test = test_frame[feature_columns]
+    y = train_frame[target_column].to_numpy()
+
+    for fold_index, (train_index, valid_index) in enumerate(splitter.split(train_frame[feature_columns], y, groups=groups), start=1):
+        LOGGER.info(
+            "Negative-bagged model %s | fold %s/%s | train_rows=%s | valid_rows=%s | bags=%s",
+            model_name,
+            fold_index,
+            config.n_splits,
+            len(train_index),
+            len(valid_index),
+            config.negative_bagging_bags,
+        )
+        train_fold = train_frame.iloc[train_index].reset_index(drop=True)
+        X_valid_fold = train_frame.iloc[valid_index][feature_columns]
+        y_valid_fold = train_frame.iloc[valid_index][target_column].to_numpy()
+
+        bag_valid_probabilities: list[np.ndarray] = []
+        bag_test_probabilities: list[np.ndarray] = []
+        for bag_index in range(config.negative_bagging_bags):
+            rng = np.random.default_rng(config.random_state + fold_index * 10_000 + bag_index)
+            bagged_train = _sample_negative_bag(
+                train_fold=train_fold,
+                target_column=target_column,
+                rng=rng,
+                negative_fraction=config.negative_bagging_negative_fraction,
+            )
+            estimator = estimator_factory()
+            if model_name.endswith("catboost"):
+                estimator.fit(
+                    bagged_train[feature_columns],
+                    bagged_train[target_column].to_numpy(),
+                    eval_set=(X_valid_fold, y_valid_fold),
+                    use_best_model=True,
+                )
+            else:
+                estimator.fit(
+                    bagged_train[feature_columns],
+                    bagged_train[target_column].to_numpy(),
+                )
+            bag_valid_probabilities.append(predict_probabilities(estimator, X_valid_fold))
+            bag_test_probabilities.append(predict_probabilities(estimator, X_test))
+
+        valid_probabilities = np.mean(np.vstack(bag_valid_probabilities), axis=0)
+        test_probabilities = np.mean(np.vstack(bag_test_probabilities), axis=0)
+        oof_probabilities[valid_index] = valid_probabilities
+        test_fold_probabilities.append(test_probabilities)
+        fold_rows.append(
+            {
+                "fold": fold_index,
+                "f1_at_0_50": float(f1_score(y_valid_fold, (valid_probabilities >= 0.50).astype(int))),
+            }
+        )
+        LOGGER.info(
+            "Negative-bagged model %s | fold %s complete | f1_at_0_50=%.4f",
+            model_name,
+            fold_index,
+            fold_rows[-1]["f1_at_0_50"],
+        )
+
+    threshold, oof_f1 = optimize_threshold(
+        y_true=y,
+        probabilities=oof_probabilities,
+        threshold_min=config.optimize_threshold_min,
+        threshold_max=config.optimize_threshold_max,
+        threshold_step=config.optimize_threshold_step,
+    )
+    mean_test_probability = np.mean(np.vstack(test_fold_probabilities), axis=0)
+    LOGGER.info(
+        "Negative-bagged model %s complete | optimized_threshold=%.2f | oof_f1=%.4f",
+        model_name,
+        threshold,
+        oof_f1,
+    )
+
+    return {
+        "model_name": model_name,
+        "oof_probabilities": oof_probabilities,
+        "test_probabilities": mean_test_probability,
+        "threshold": threshold,
+        "oof_f1": oof_f1,
+        "fold_rows": fold_rows,
+    }
+
+
 def _candidate_record(
     name: str,
     probabilities: np.ndarray,
@@ -427,6 +558,52 @@ def _best_weighted_ensemble_candidates(
     return weighted_candidates
 
 
+def _stacking_model_factories(random_state: int) -> dict[str, EstimatorFactory]:
+    return {
+        "stacking_logistic_regression": _logistic_factory(random_state),
+        "stacking_hist_gradient_boosting": _hist_gradient_factory(random_state),
+    }
+
+
+def _run_stacking_candidates(
+    model_outputs: dict[str, dict[str, object]],
+    train_frame: pd.DataFrame,
+    test_frame: pd.DataFrame,
+    groups: pd.Series,
+    config: ModelConfig,
+) -> dict[str, dict[str, object]]:
+    ranked_model_names = [
+        str(output["model_name"])
+        for output in sorted(model_outputs.values(), key=lambda item: float(item["oof_f1"]), reverse=True)[: config.stacking_top_k]
+    ]
+    if len(ranked_model_names) < 2:
+        return {}
+
+    LOGGER.info("Building stacking candidates from base models %s", ranked_model_names)
+    meta_train = train_frame[[config.id_column, config.target_column, "spatial_group"]].copy()
+    meta_test = test_frame[[config.id_column]].copy()
+    for model_name in ranked_model_names:
+        meta_train[model_name] = np.asarray(model_outputs[model_name]["oof_probabilities"])
+        meta_test[model_name] = np.asarray(model_outputs[model_name]["test_probabilities"])
+
+    splitter = StratifiedGroupKFold(n_splits=config.n_splits, shuffle=True, random_state=config.random_state)
+    stacking_outputs: dict[str, dict[str, object]] = {}
+    for stack_name, estimator_factory in _stacking_model_factories(config.random_state).items():
+        with log_step(LOGGER, f"Train stacking model {stack_name}"):
+            stacking_outputs[stack_name] = _run_cross_validated_model(
+                model_name=stack_name,
+                estimator_factory=estimator_factory,
+                train_frame=meta_train,
+                test_frame=meta_test,
+                feature_columns=ranked_model_names,
+                target_column=config.target_column,
+                splitter=splitter,
+                groups=groups,
+                config=config,
+            )
+    return stacking_outputs
+
+
 def run_baseline_suite(config: ModelConfig) -> ModelRunArtifacts:
     output_dir = ensure_directory(config.output_dir)
     train_frame, test_frame, manifest = load_feature_tables(config.feature_dir)
@@ -444,11 +621,29 @@ def run_baseline_suite(config: ModelConfig) -> ModelRunArtifacts:
     model_outputs: dict[str, dict[str, object]] = {}
     y_true = train_frame[config.target_column].to_numpy()
 
-    for model_name, estimator_factory in get_baseline_model_factories(config.random_state).items():
+    baseline_factories = get_baseline_model_factories(config.random_state)
+    for model_name, estimator_factory in baseline_factories.items():
         with log_step(LOGGER, f"Train baseline model {model_name}"):
             model_outputs[model_name] = _run_cross_validated_model(
                 model_name=model_name,
                 estimator_factory=estimator_factory,
+                train_frame=train_frame,
+                test_frame=test_frame,
+                feature_columns=feature_columns,
+                target_column=config.target_column,
+                splitter=splitter,
+                groups=groups,
+                config=config,
+            )
+
+    for base_model_name in config.negative_bagging_models:
+        if base_model_name not in baseline_factories:
+            continue
+        bagged_model_name = f"negative_bagged_{base_model_name}"
+        with log_step(LOGGER, f"Train negative-bagged model {bagged_model_name}"):
+            model_outputs[bagged_model_name] = _run_negative_bagged_model(
+                model_name=bagged_model_name,
+                estimator_factory=baseline_factories[base_model_name],
                 train_frame=train_frame,
                 test_frame=test_frame,
                 feature_columns=feature_columns,
@@ -476,6 +671,9 @@ def run_baseline_suite(config: ModelConfig) -> ModelRunArtifacts:
             )
 
     candidate_outputs.update(_best_weighted_ensemble_candidates(model_outputs, y_true, config))
+    stacking_outputs = _run_stacking_candidates(model_outputs, train_frame, test_frame, groups, config)
+    candidate_outputs.update(stacking_outputs)
+    model_outputs.update(stacking_outputs)
 
     best_name, best_output = max(candidate_outputs.items(), key=lambda item: float(item[1]["oof_f1"]))
     LOGGER.info(

@@ -190,14 +190,22 @@ def compute_feature_dataset(dataset: xr.Dataset, config: FeatureBuildConfig) -> 
         feature_arrays[f"{variable_name}_seasonal_amp"] = seasonal_stack.max(axis=0) - seasonal_stack.min(axis=0)
 
         median_surface = feature_arrays[f"{variable_name}_median"]
-        rolling = median_surface.rolling(
-            lat=config.neighborhood_size,
-            lon=config.neighborhood_size,
-            center=True,
-            min_periods=1,
-        )
-        feature_arrays[f"{variable_name}_local_mean"] = rolling.mean()
-        feature_arrays[f"{variable_name}_local_std"] = rolling.std()
+        for neighborhood_size in config.neighborhood_sizes:
+            rolling = median_surface.rolling(
+                lat=neighborhood_size,
+                lon=neighborhood_size,
+                center=True,
+                min_periods=1,
+            )
+            local_mean = rolling.mean()
+            local_std = rolling.std()
+            local_min = rolling.min()
+            local_max = rolling.max()
+            suffix = f"w{neighborhood_size}"
+            feature_arrays[f"{variable_name}_local_mean_{suffix}"] = local_mean
+            feature_arrays[f"{variable_name}_local_std_{suffix}"] = local_std
+            feature_arrays[f"{variable_name}_local_range_{suffix}"] = local_max - local_min
+            feature_arrays[f"{variable_name}_local_contrast_{suffix}"] = median_surface - local_mean
         feature_arrays[f"{variable_name}_cv"] = _safe_ratio(
             feature_arrays[f"{variable_name}_std"],
             np.abs(feature_arrays[f"{variable_name}_mean"]) + 1e-6,
@@ -380,15 +388,39 @@ def build_feature_artifacts(config: FeatureBuildConfig) -> FeatureArtifacts:
                     _quantile_name(config.quantiles[1]),
                     "trend",
                     f"last{config.last_n_months}_mean",
-                    "djf_mean",
-                    "mam_mean",
-                    "jja_mean",
-                    "son_mean",
-                    "local_mean",
-                    "local_std",
-                ],
-                "dropped_all_null_columns": dropped_columns,
-                "spatial_group_size_degrees": config.spatial_group_size_degrees,
+                "djf_mean",
+                "mam_mean",
+                "jja_mean",
+                "son_mean",
+                "seasonal_amp",
+                "cv",
+                "local_mean_w3",
+                "local_std_w3",
+                "local_range_w3",
+                "local_contrast_w3",
+                "local_mean_w5",
+                "local_std_w5",
+                "local_range_w5",
+                "local_contrast_w5",
+                "local_mean_w7",
+                "local_std_w7",
+                "local_range_w7",
+                "local_contrast_w7",
+                "bio_mean_diurnal_range",
+                "bio_temp_annual_range",
+                "bio_isothermality_proxy",
+                "bio_annual_ppt_total",
+                "bio_wettest_quarter_ppt",
+                "bio_driest_quarter_ppt",
+                "bio_warmest_quarter_tmax",
+                "bio_coldest_quarter_tmin",
+                "bio_wettest_quarter_soil",
+                "bio_driest_quarter_soil",
+                "bio_water_balance_total",
+                "bio_water_balance_last6",
+            ],
+            "dropped_all_null_columns": dropped_columns,
+            "spatial_group_size_degrees": config.spatial_group_size_degrees,
             },
         )
     LOGGER.info("Feature artifacts written | train=%s | test=%s | manifest=%s", train_path, test_path, manifest_path)

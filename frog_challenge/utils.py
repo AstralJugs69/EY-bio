@@ -51,6 +51,10 @@ def configure_logging(level: int = logging.INFO) -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
+    logging.getLogger("azure").setLevel(logging.WARNING)
+    logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
+    logging.getLogger("adlfs").setLevel(logging.WARNING)
+    logging.getLogger("fsspec").setLevel(logging.WARNING)
 
 
 @contextmanager

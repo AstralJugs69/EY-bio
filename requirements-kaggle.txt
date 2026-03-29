@@ -4,6 +4,7 @@ pyarrow>=15.0.0
 scikit-learn==1.5.2
 joblib>=1.4.0
 xarray==2024.10.0
+dask[array]>=2024.10.0
 fsspec==2024.10.0
 pystac==1.11.0
 pystac-client==0.8.5

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib.util
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
@@ -61,6 +62,12 @@ def open_terraclimate_dataset(config: FeatureBuildConfig) -> xr.Dataset:
     import pystac_client
     import xarray as xr
 
+    if importlib.util.find_spec("dask") is None:
+        raise RuntimeError(
+            "TerraClimate feature extraction requires dask, but it is not installed. "
+            "Install the Kaggle requirements from requirements-kaggle.txt and rerun."
+        )
+
     catalog = pystac_client.Client.open(
         "https://planetarycomputer.microsoft.com/api/stac/v1",
         modifier=planetary_computer.sign_inplace,
@@ -79,7 +86,15 @@ def open_terraclimate_dataset(config: FeatureBuildConfig) -> xr.Dataset:
         max_lon=config.max_lon,
         max_lat=config.max_lat,
     ):
-        dataset = xr.open_dataset(asset.href, **open_kwargs)
+        try:
+            dataset = xr.open_dataset(asset.href, **open_kwargs)
+        except ValueError as exc:
+            if "unrecognized chunk manager dask" in str(exc):
+                raise RuntimeError(
+                    "xarray attempted to use dask chunking, but dask is unavailable in the runtime. "
+                    "Install the dependencies from requirements-kaggle.txt and rerun the notebook."
+                ) from exc
+            raise
         dataset = dataset.drop_vars("crs", errors="ignore")
         dataset = dataset.sel(time=slice(config.start_date, config.end_date))
         dataset = dataset[list(config.variables)]

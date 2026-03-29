@@ -6,14 +6,14 @@ from pathlib import Path
 
 from frog_challenge.bootstrap import ensure_feature_artifacts
 from frog_challenge.config import TPUConfig
-from frog_challenge.tpu import run_tpu_suite
+from frog_challenge.tpu import run_gpu_suite
 from frog_challenge.utils import configure_logging
 
 LOGGER = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train TPU neural models for the EY frog challenge.")
+    parser = argparse.ArgumentParser(description="Train GPU neural models for the EY frog challenge.")
     parser.add_argument("--data-root", type=Path, default=Path("."))
     parser.add_argument("--feature-dir", type=Path, default=Path("artifacts/features"))
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts/tpu"))
@@ -27,7 +27,7 @@ def main() -> int:
     configure_logging()
     args = parse_args()
     LOGGER.info(
-        "TPU entrypoint starting | data_root=%s | feature_dir=%s | output_dir=%s | batch_size=%s | epochs=%s | patience=%s",
+        "GPU entrypoint starting | data_root=%s | feature_dir=%s | output_dir=%s | batch_size=%s | epochs=%s | patience=%s",
         args.data_root,
         args.feature_dir,
         args.output_dir,
@@ -43,8 +43,8 @@ def main() -> int:
         epochs=args.epochs,
         patience=args.patience,
     )
-    artifacts = run_tpu_suite(config)
-    LOGGER.info("TPU entrypoint finished | summary=%s | best_model=%s", artifacts.summary_path, artifacts.best_model_name)
+    artifacts = run_gpu_suite(config)
+    LOGGER.info("GPU entrypoint finished | summary=%s | best_model=%s", artifacts.summary_path, artifacts.best_model_name)
     return 0
 
 

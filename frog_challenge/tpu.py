@@ -22,55 +22,44 @@ from .utils import ensure_directory, log_step, read_json, write_dataframe_parque
 LOGGER = logging.getLogger(__name__)
 
 @dataclass(slots=True)
-class TPURunArtifacts:
+class GPURunArtifacts:
     summary_path: Path
     best_model_name: str
     best_threshold: float
     best_oof_f1: float
 
 
-def create_tpu_strategy():
+TPURunArtifacts = GPURunArtifacts
+
+
+def create_gpu_strategy():
     import tensorflow as tf
 
-    attempts: list[tuple[str, str | None]] = []
-    env_tpu_name = os.getenv("TPU_NAME")
-    if env_tpu_name:
-        attempts.append(("env_tpu_name", env_tpu_name))
-    attempts.extend(
-        [
-            ("local", "local"),
-            ("empty", ""),
-            ("auto", None),
-        ]
+    physical_gpus = tf.config.list_physical_devices("GPU")
+    logical_gpus = tf.config.list_logical_devices("GPU")
+    LOGGER.info(
+        "Visible GPU devices | physical=%s | logical=%s | names=%s",
+        len(physical_gpus),
+        len(logical_gpus),
+        [device.name for device in physical_gpus],
     )
 
-    errors: list[str] = []
-    for label, tpu_value in attempts:
+    for device in physical_gpus:
         try:
-            LOGGER.info("Trying TPU initialization mode=%s value=%s", label, tpu_value)
-            if tpu_value is None:
-                resolver = tf.distribute.cluster_resolver.TPUClusterResolver.connect()
-            else:
-                resolver = tf.distribute.cluster_resolver.TPUClusterResolver.connect(tpu=tpu_value)
-            strategy = tf.distribute.TPUStrategy(resolver)
-            logical_tpus = tf.config.list_logical_devices("TPU")
-            metadata = resolver.get_tpu_system_metadata()
-            LOGGER.info(
-                "TPU initialized | mode=%s | replicas=%s | logical_tpu_count=%s | num_hosts=%s | num_cores=%s",
-                label,
-                strategy.num_replicas_in_sync,
-                len(logical_tpus),
-                getattr(metadata, "num_hosts", "unknown"),
-                getattr(metadata, "num_cores", "unknown"),
-            )
-            return tf, strategy, "TPU", {"mode": label, "logical_tpu_count": len(logical_tpus)}
+            tf.config.experimental.set_memory_growth(device, True)
         except Exception as exc:
-            error_message = f"{label}: {type(exc).__name__}: {exc}"
-            errors.append(error_message)
-            LOGGER.warning("TPU initialization failed | %s", error_message)
+            LOGGER.warning("Could not enable memory growth for %s | %s: %s", device.name, type(exc).__name__, exc)
+
+    if physical_gpus:
+        strategy = tf.distribute.MirroredStrategy()
+        return tf, strategy, "GPU", {
+            "physical_gpu_count": len(physical_gpus),
+            "logical_gpu_count": len(tf.config.list_logical_devices("GPU")),
+            "replicas": strategy.num_replicas_in_sync,
+        }
 
     strategy = tf.distribute.get_strategy()
-    return tf, strategy, "CPU_OR_GPU", {"errors": errors}
+    return tf, strategy, "CPU", {"physical_gpu_count": 0, "logical_gpu_count": 0, "replicas": 1}
 
 
 def _dense_mlp(tf, input_dim: int, hidden_units: tuple[int, ...], dropout: float, learning_rate: float):
@@ -163,7 +152,7 @@ def _fit_single_architecture(
 
     for fold_index, (train_index, valid_index) in enumerate(splitter.split(X, y, groups=groups), start=1):
         LOGGER.info(
-            "TPU architecture %s | fold %s/%s | train_rows=%s | valid_rows=%s",
+            "Neural architecture %s | fold %s/%s | train_rows=%s | valid_rows=%s",
             architecture,
             fold_index,
             config.n_splits,
@@ -173,6 +162,7 @@ def _fit_single_architecture(
         tf.keras.backend.clear_session()
         tf.keras.utils.set_random_seed(config.random_state + fold_index)
 
+        effective_batch_size = int(config.batch_size * max(1, strategy.num_replicas_in_sync))
         fold_preprocessor = _preprocessor()
         X_train_fold = fold_preprocessor.fit_transform(X.iloc[train_index]).astype("float32")
         X_valid_fold = fold_preprocessor.transform(X.iloc[valid_index]).astype("float32")
@@ -206,14 +196,14 @@ def _fit_single_architecture(
             y_train_fold,
             validation_data=(X_valid_fold, y_valid_fold),
             epochs=config.epochs,
-            batch_size=config.batch_size,
+            batch_size=effective_batch_size,
             verbose=0,
             callbacks=callbacks,
             class_weight=class_weight,
         )
 
-        valid_probabilities = model.predict(X_valid_fold, batch_size=config.batch_size, verbose=0).reshape(-1)
-        test_probabilities = model.predict(X_test_fold, batch_size=config.batch_size, verbose=0).reshape(-1)
+        valid_probabilities = model.predict(X_valid_fold, batch_size=effective_batch_size, verbose=0).reshape(-1)
+        test_probabilities = model.predict(X_test_fold, batch_size=effective_batch_size, verbose=0).reshape(-1)
         oof_probabilities[valid_index] = valid_probabilities
         test_fold_probabilities.append(test_probabilities)
         fold_rows.append(
@@ -224,10 +214,11 @@ def _fit_single_architecture(
             }
         )
         LOGGER.info(
-            "TPU architecture %s | fold %s complete | best_epoch=%s | f1_at_0_50=%.4f",
+            "Neural architecture %s | fold %s complete | best_epoch=%s | batch_size=%s | f1_at_0_50=%.4f",
             architecture,
             fold_index,
             fold_rows[-1]["best_epoch"],
+            effective_batch_size,
             fold_rows[-1]["f1_at_0_50"],
         )
 
@@ -244,7 +235,7 @@ def _fit_single_architecture(
         threshold_step=config.optimize_threshold_step,
     )
     LOGGER.info(
-        "TPU architecture %s complete | optimized_threshold=%.2f | oof_f1=%.4f",
+        "Neural architecture %s complete | optimized_threshold=%.2f | oof_f1=%.4f",
         architecture,
         threshold,
         oof_f1,
@@ -278,20 +269,20 @@ def _candidate_record(name: str, probabilities: np.ndarray, test_probabilities: 
     }
 
 
-def run_tpu_suite(config: TPUConfig) -> TPURunArtifacts:
+def run_gpu_suite(config: TPUConfig) -> GPURunArtifacts:
     output_dir = ensure_directory(config.output_dir)
     train_frame, test_frame, _ = load_feature_tables(config.feature_dir)
     feature_columns = select_feature_columns(train_frame, config.protected_columns)
     y_true = train_frame[config.target_column].to_numpy().astype(int)
 
-    tf, strategy, accelerator, accelerator_details = create_tpu_strategy()
-    if accelerator != "TPU" and config.require_tpu:
+    tf, strategy, accelerator, accelerator_details = create_gpu_strategy()
+    if accelerator != "GPU" and config.require_tpu:
         raise RuntimeError(
-            "TPU stage was requested, but no TPU was initialized. "
-            f"Initialization attempts: {accelerator_details.get('errors', [])}"
+            "GPU stage was requested, but no GPU was initialized. "
+            f"Visible devices: {accelerator_details}"
         )
     LOGGER.info(
-        "Starting TPU suite | accelerator=%s | accelerator_details=%s | output_dir=%s | feature_count=%s | architectures=%s",
+        "Starting GPU suite | accelerator=%s | accelerator_details=%s | output_dir=%s | feature_count=%s | architectures=%s",
         accelerator,
         accelerator_details,
         output_dir,
@@ -300,7 +291,7 @@ def run_tpu_suite(config: TPUConfig) -> TPURunArtifacts:
     )
     architecture_outputs: dict[str, dict[str, object]] = {}
     for architecture in config.architectures:
-        with log_step(LOGGER, f"Train TPU architecture {architecture}"):
+        with log_step(LOGGER, f"Train neural architecture {architecture}"):
             architecture_outputs[architecture] = _fit_single_architecture(
                 tf=tf,
                 strategy=strategy,
@@ -322,7 +313,7 @@ def run_tpu_suite(config: TPUConfig) -> TPURunArtifacts:
 
     best_name, best_output = max(candidates.items(), key=lambda item: float(item[1]["oof_f1"]))
     LOGGER.info(
-        "Best TPU candidate selected | name=%s | oof_f1=%.4f | threshold=%.2f",
+        "Best neural candidate selected | name=%s | oof_f1=%.4f | threshold=%.2f",
         best_name,
         best_output["oof_f1"],
         best_output["threshold"],
@@ -378,14 +369,18 @@ def run_tpu_suite(config: TPUConfig) -> TPURunArtifacts:
             "best_oof_f1": float(best_output["oof_f1"]),
         },
     )
-    LOGGER.info("TPU suite finished | summary=%s", summary_path)
+    LOGGER.info("GPU suite finished | summary=%s", summary_path)
 
-    return TPURunArtifacts(
+    return GPURunArtifacts(
         summary_path=summary_path,
         best_model_name=best_name,
         best_threshold=float(best_output["threshold"]),
         best_oof_f1=float(best_output["oof_f1"]),
     )
+
+
+def run_tpu_suite(config: TPUConfig) -> TPURunArtifacts:
+    return run_gpu_suite(config)
 
 
 def predict_saved_tpu_ensemble(

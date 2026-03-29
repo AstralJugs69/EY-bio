@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Bootstrap the EY frog challenge pipeline inside Kaggle.")
     parser.add_argument("--github-repo", required=True)
     parser.add_argument("--github-ref", default="main")
-    parser.add_argument("--stage", choices=("feature", "baseline", "tpu", "finalize"), required=True)
+    parser.add_argument("--stage", choices=("feature", "baseline", "gpu", "tpu", "finalize"), required=True)
     parser.add_argument("--repo-dir", type=Path, default=Path("/kaggle/working/ey-frog-repo"))
     parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--feature-dir", type=Path, default=Path("/kaggle/working/artifacts/features"))

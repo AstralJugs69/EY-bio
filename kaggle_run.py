@@ -10,7 +10,7 @@ from frog_challenge.bootstrap import ensure_feature_artifacts
 from frog_challenge.config import FeatureBuildConfig, ModelConfig, TPUConfig
 from frog_challenge.features import build_feature_artifacts
 from frog_challenge.modeling import run_baseline_suite
-from frog_challenge.tpu import run_tpu_suite
+from frog_challenge.tpu import run_gpu_suite
 from frog_challenge.utils import configure_logging
 
 LOGGER = logging.getLogger(__name__)
@@ -18,7 +18,7 @@ LOGGER = logging.getLogger(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Unified runner for Kaggle stages.")
-    parser.add_argument("--stage", choices=("feature", "baseline", "tpu", "finalize"), required=True)
+    parser.add_argument("--stage", choices=("feature", "baseline", "gpu", "tpu", "finalize"), required=True)
     parser.add_argument("--data-root", type=Path, default=Path("."))
     parser.add_argument("--train-path", type=Path, default=None)
     parser.add_argument("--test-path", type=Path, default=None)
@@ -43,7 +43,7 @@ def main() -> int:
     args = parse_args()
     train_path, test_path = resolve_data_paths(args)
     LOGGER.info(
-        "Kaggle runner starting | stage=%s | data_root=%s | feature_dir=%s | baseline_dir=%s | tpu_dir=%s",
+        "Kaggle runner starting | stage=%s | data_root=%s | feature_dir=%s | baseline_dir=%s | accelerator_dir=%s",
         args.stage,
         args.data_root,
         args.feature_dir,
@@ -91,9 +91,9 @@ def main() -> int:
         LOGGER.info("Kaggle runner finished baseline stage")
         return 0
 
-    if args.stage == "tpu":
+    if args.stage in {"gpu", "tpu"}:
         ensure_feature_artifacts(args.feature_dir, args.data_root, train_path=train_path, test_path=test_path)
-        artifacts = run_tpu_suite(
+        artifacts = run_gpu_suite(
             TPUConfig(
                 feature_dir=args.feature_dir,
                 output_dir=args.tpu_dir,
@@ -118,7 +118,7 @@ def main() -> int:
                 indent=2,
             )
         )
-        LOGGER.info("Kaggle runner finished tpu stage")
+        LOGGER.info("Kaggle runner finished gpu stage")
         return 0
 
     ensure_feature_artifacts(args.feature_dir, args.data_root, train_path=train_path, test_path=test_path)

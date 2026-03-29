@@ -8,7 +8,7 @@ This repo contains a Kaggle-ready implementation for the EY Biodiversity frog ch
 - `kaggle_run.py`: unified stage dispatcher used after bootstrap
 - `feature_build.py`: TerraClimate feature extraction entrypoint
 - `baseline_models.py`: CPU baseline training plus final submission selection
-- `tpu_train.py`: TPU neural training entrypoint
+- `tpu_train.py`: neural training entrypoint, now GPU-first
 - `frog_challenge/`: shared feature, modeling, TPU, and bootstrap code
 - `notebooks/run_on_kaggle.ipynb`: the single Kaggle notebook you run
 
@@ -19,10 +19,10 @@ Use `notebooks/run_on_kaggle.ipynb` directly on Kaggle with internet enabled. It
 - Cell 1: config
 - Cell 2: download and run `kaggle_bootstrap.py`
 
-The default stage is `tpu`, which does the full run:
+The default stage is `gpu`, which does the full run:
 
 - builds features if needed from repo-local CSVs
-- trains TPU neural models
+- trains neural models on available GPUs
 - runs CPU baselines in the same session
 - writes `artifacts/baselines/final_submission.csv`
 
@@ -49,6 +49,6 @@ If you want a CPU-only run, change `STAGE` to `baseline` in the first cell.
 
 - Latitude and longitude are used only for TerraClimate lookup and spatial grouping.
 - The modeling code excludes `ID`, `Latitude`, `Longitude`, and `spatial_group` from the learned feature matrix.
-- CPU baselines remain the control path. TPU is only used to accelerate neural training experiments.
+- CPU baselines remain the control path. The neural stage is now GPU-first and will use all visible GPUs via TensorFlow distribution strategy.
 - Pipeline logs are timestamped and include stage, fold, artifact, and model-selection reporting so Kaggle output is easy to follow.
 - If the last log line says `Installing requirements ...`, that is progress, not a failure. The bootstrap script is still in the dependency installation phase until a real traceback appears.

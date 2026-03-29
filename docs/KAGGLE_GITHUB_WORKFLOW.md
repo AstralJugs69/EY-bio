@@ -14,8 +14,8 @@ No separate Kaggle dataset is required for the source training and test data.
 
 `notebooks/run_on_kaggle.ipynb` is now the only Kaggle notebook in the repo.
 
-- Default `STAGE` is `tpu`
-- That full run builds features, trains TPU models, runs CPU baselines, compares both, and writes `artifacts/baselines/final_submission.csv`
+- Default `STAGE` is `gpu`
+- That full run builds features, trains neural models on available GPUs, runs CPU baselines, compares both, and writes `artifacts/baselines/final_submission.csv`
 - If you want a lighter run, change `STAGE` to `baseline`
 
 ## How bootstrap works

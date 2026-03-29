@@ -17,12 +17,14 @@ if TYPE_CHECKING:
     import xarray as xr
 
 LOGGER = logging.getLogger(__name__)
+FEATURE_SCHEMA_VERSION = 2
 
 
 @dataclass(slots=True)
 class FeatureArtifacts:
     train_features_path: Path
     test_features_path: Path
+    pseudo_absence_candidates_path: Path
     manifest_path: Path
     feature_columns: list[str]
     dropped_feature_columns: list[str]
@@ -32,6 +34,7 @@ class FeatureArtifacts:
         return {
             "train_features_path": str(self.train_features_path),
             "test_features_path": str(self.test_features_path),
+            "pseudo_absence_candidates_path": str(self.pseudo_absence_candidates_path),
             "manifest_path": str(self.manifest_path),
             "feature_columns": self.feature_columns,
             "dropped_feature_columns": self.dropped_feature_columns,
@@ -263,6 +266,29 @@ def sample_feature_dataset(feature_dataset: xr.Dataset, points_frame: pd.DataFra
     return sampled_frame.apply(lambda column: column.map(coerce_native))
 
 
+def sample_pseudo_absence_candidates(
+    feature_dataset: xr.Dataset,
+    config: FeatureBuildConfig,
+) -> pd.DataFrame:
+    stride = max(1, int(config.pseudo_absence_grid_stride))
+    LOGGER.info(
+        "Sampling pseudo-absence candidate grid | stride=%s | max_candidates=%s",
+        stride,
+        config.pseudo_absence_max_candidates,
+    )
+    candidate_grid = feature_dataset.isel(lat=slice(None, None, stride), lon=slice(None, None, stride))
+    candidate_frame = candidate_grid.to_dataframe().reset_index()
+    candidate_frame = candidate_frame.dropna(how="all", subset=list(feature_dataset.data_vars))
+    candidate_frame = candidate_frame.rename(columns={"lat": "Latitude", "lon": "Longitude"})
+    if candidate_frame.shape[0] > config.pseudo_absence_max_candidates:
+        candidate_frame = candidate_frame.sample(
+            n=config.pseudo_absence_max_candidates,
+            random_state=42,
+        ).reset_index(drop=True)
+    LOGGER.info("Prepared pseudo-absence candidates | rows=%s", candidate_frame.shape[0])
+    return candidate_frame.apply(lambda column: column.map(coerce_native))
+
+
 def _drop_all_null_feature_columns(
     train_features: pd.DataFrame,
     test_features: pd.DataFrame,
@@ -310,6 +336,8 @@ def build_feature_artifacts(config: FeatureBuildConfig) -> FeatureArtifacts:
                     [coordinate_frame, sample_feature_dataset(feature_dataset, coordinate_frame)],
                     axis=1,
                 )
+            with log_step(LOGGER, "Sample pseudo-absence candidates"):
+                pseudo_absence_candidates = sample_pseudo_absence_candidates(feature_dataset, config)
         finally:
             feature_dataset.close()
     finally:
@@ -357,17 +385,21 @@ def build_feature_artifacts(config: FeatureBuildConfig) -> FeatureArtifacts:
 
     train_path = output_dir / "train_features.parquet"
     test_path = output_dir / "test_features.parquet"
+    pseudo_absence_candidates_path = output_dir / "pseudo_absence_candidates.parquet"
     manifest_path = output_dir / "feature_manifest.json"
 
     with log_step(LOGGER, "Write feature artifacts", output_dir=output_dir):
         write_dataframe_parquet(train_path, train_features)
         write_dataframe_parquet(test_path, test_features)
+        write_dataframe_parquet(pseudo_absence_candidates_path, pseudo_absence_candidates)
         write_json(
             manifest_path,
             {
                 "train_rows": int(train_features.shape[0]),
                 "test_rows": int(test_features.shape[0]),
+                "pseudo_absence_candidate_rows": int(pseudo_absence_candidates.shape[0]),
                 "coordinate_rows": int(coordinate_frame.shape[0]),
+                "feature_schema_version": FEATURE_SCHEMA_VERSION,
                 "start_date": config.start_date,
                 "end_date": config.end_date,
                 "bounds": {
@@ -423,11 +455,18 @@ def build_feature_artifacts(config: FeatureBuildConfig) -> FeatureArtifacts:
             "spatial_group_size_degrees": config.spatial_group_size_degrees,
             },
         )
-    LOGGER.info("Feature artifacts written | train=%s | test=%s | manifest=%s", train_path, test_path, manifest_path)
+    LOGGER.info(
+        "Feature artifacts written | train=%s | test=%s | pseudo_absence_candidates=%s | manifest=%s",
+        train_path,
+        test_path,
+        pseudo_absence_candidates_path,
+        manifest_path,
+    )
 
     return FeatureArtifacts(
         train_features_path=train_path,
         test_features_path=test_path,
+        pseudo_absence_candidates_path=pseudo_absence_candidates_path,
         manifest_path=manifest_path,
         feature_columns=feature_columns,
         dropped_feature_columns=dropped_columns,

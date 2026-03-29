@@ -271,7 +271,7 @@ def _candidate_record(name: str, probabilities: np.ndarray, test_probabilities: 
 
 def run_gpu_suite(config: TPUConfig) -> GPURunArtifacts:
     output_dir = ensure_directory(config.output_dir)
-    train_frame, test_frame, _ = load_feature_tables(config.feature_dir)
+    train_frame, test_frame, _, _ = load_feature_tables(config.feature_dir)
     feature_columns = select_feature_columns(train_frame, config.protected_columns)
     y_true = train_frame[config.target_column].to_numpy().astype(int)
 
@@ -320,7 +320,7 @@ def run_gpu_suite(config: TPUConfig) -> GPURunArtifacts:
     )
 
     predictions_dir = ensure_directory(output_dir / "predictions")
-    for name, output in architecture_outputs.items():
+    for name, output in candidates.items():
         write_dataframe_parquet(
             predictions_dir / f"{name}_oof.parquet",
             pd.DataFrame(

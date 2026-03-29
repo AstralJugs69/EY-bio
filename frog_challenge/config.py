@@ -40,6 +40,8 @@ class FeatureBuildConfig:
     neighborhood_sizes: tuple[int, ...] = (3, 5, 7)
     quantiles: tuple[float, float] = (0.10, 0.90)
     spatial_group_size_degrees: float = 0.5
+    pseudo_absence_grid_stride: int = 2
+    pseudo_absence_max_candidates: int = 20000
 
 
 @dataclass(slots=True)
@@ -54,11 +56,17 @@ class ModelConfig:
     optimize_threshold_min: float = 0.10
     optimize_threshold_max: float = 0.90
     optimize_threshold_step: float = 0.01
+    multi_seed_values: tuple[int, ...] = (42, 202, 404)
     negative_bagging_bags: int = 5
     negative_bagging_models: tuple[str, ...] = ("extra_trees", "xgboost")
     negative_bagging_negative_fraction: float = 1.0
+    pseudo_absence_models: tuple[str, ...] = ("extra_trees", "xgboost")
+    pseudo_absence_positive_ratio: float = 1.0
+    pseudo_absence_far_quantile: float = 0.80
     stacking_models: tuple[str, ...] = ("logistic_regression", "hist_gradient_boosting")
     stacking_top_k: int = 5
+    threshold_sweep_radius: float = 0.12
+    threshold_sweep_step: float = 0.02
     protected_columns: tuple[str, ...] = (
         "ID",
         "Latitude",

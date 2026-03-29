@@ -12,6 +12,7 @@ from sklearn.ensemble import ExtraTreesClassifier, HistGradientBoostingClassifie
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import f1_score
+from sklearn.neighbors import NearestNeighbors
 from sklearn.model_selection import StratifiedGroupKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MinMaxScaler
@@ -33,18 +34,21 @@ class ModelRunArtifacts:
     best_oof_f1: float
 
 
-def load_feature_tables(feature_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
+def load_feature_tables(feature_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None, dict[str, object]]:
     LOGGER.info("Loading feature tables from %s", feature_dir)
     train_features = read_dataframe_parquet(feature_dir / "train_features.parquet")
     test_features = read_dataframe_parquet(feature_dir / "test_features.parquet")
+    pseudo_absence_path = feature_dir / "pseudo_absence_candidates.parquet"
+    pseudo_absence_candidates = read_dataframe_parquet(pseudo_absence_path) if pseudo_absence_path.exists() else None
     manifest = read_json(feature_dir / "feature_manifest.json")
     LOGGER.info(
-        "Loaded feature tables | train_rows=%s | test_rows=%s | feature_count=%s",
+        "Loaded feature tables | train_rows=%s | test_rows=%s | pseudo_absence_rows=%s | feature_count=%s",
         train_features.shape[0],
         test_features.shape[0],
+        0 if pseudo_absence_candidates is None else pseudo_absence_candidates.shape[0],
         len(manifest.get("feature_columns", [])),
     )
-    return train_features, test_features, manifest
+    return train_features, test_features, pseudo_absence_candidates, manifest
 
 
 def select_feature_columns(frame: pd.DataFrame, protected_columns: tuple[str, ...]) -> list[str]:
@@ -150,6 +154,30 @@ def _extra_trees_factory(random_state: int) -> EstimatorFactory:
     return factory
 
 
+def _extra_trees_variant_factory(random_state: int, max_features: float, min_samples_leaf: int) -> EstimatorFactory:
+    def factory() -> Pipeline:
+        return Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="median")),
+                (
+                    "classifier",
+                    ExtraTreesClassifier(
+                        n_estimators=1400,
+                        max_depth=None,
+                        min_samples_leaf=min_samples_leaf,
+                        max_features=max_features,
+                        bootstrap=True,
+                        class_weight="balanced_subsample",
+                        n_jobs=-1,
+                        random_state=random_state,
+                    ),
+                ),
+            ]
+        )
+
+    return factory
+
+
 def _catboost_factory(random_state: int) -> EstimatorFactory | None:
     try:
         from catboost import CatBoostClassifier
@@ -212,6 +240,16 @@ def get_baseline_model_factories(random_state: int) -> dict[str, EstimatorFactor
     xgboost_factory = _xgboost_factory(random_state)
     if xgboost_factory is not None:
         factories["xgboost"] = xgboost_factory
+    return factories
+
+
+def get_multi_seed_model_factories(config: ModelConfig) -> dict[str, EstimatorFactory]:
+    factories: dict[str, EstimatorFactory] = {}
+    for seed in dict.fromkeys(config.multi_seed_values):
+        factories[f"extra_trees_seed_{seed}"] = _extra_trees_variant_factory(seed, max_features=0.55, min_samples_leaf=1)
+        xgb_factory = _xgboost_factory(seed)
+        if xgb_factory is not None:
+            factories[f"xgboost_seed_{seed}"] = xgb_factory
     return factories
 
 
@@ -446,6 +484,169 @@ def _run_negative_bagged_model(
     }
 
 
+def _environmental_feature_columns(feature_columns: list[str]) -> list[str]:
+    preferred = [
+        column
+        for column in feature_columns
+        if column.startswith("bio_")
+        or column.endswith("_median")
+        or column.endswith("_seasonal_amp")
+        or column.endswith("_cv")
+        or column.endswith("_last6_mean")
+    ]
+    if len(preferred) >= 40:
+        return preferred[:60]
+    fallback = [column for column in feature_columns if column not in preferred]
+    return (preferred + fallback)[:60]
+
+
+def _select_environmental_pseudo_absences(
+    train_fold: pd.DataFrame,
+    pseudo_absence_candidates: pd.DataFrame,
+    feature_columns: list[str],
+    target_column: str,
+    ratio: float,
+    far_quantile: float,
+    rng: np.random.Generator,
+) -> pd.DataFrame:
+    positives = train_fold[train_fold[target_column] == 1]
+    if positives.empty or pseudo_absence_candidates is None or pseudo_absence_candidates.empty:
+        return pd.DataFrame(columns=train_fold.columns)
+
+    selected_feature_columns = [
+        column
+        for column in _environmental_feature_columns(feature_columns)
+        if column in positives.columns and column in pseudo_absence_candidates.columns
+    ]
+    if not selected_feature_columns:
+        return pd.DataFrame(columns=train_fold.columns)
+
+    positive_reference = positives[selected_feature_columns].replace([np.inf, -np.inf], np.nan)
+    candidate_reference = pseudo_absence_candidates[selected_feature_columns].replace([np.inf, -np.inf], np.nan)
+    positive_reference = positive_reference.fillna(positive_reference.median())
+    candidate_reference = candidate_reference.fillna(positive_reference.median())
+
+    nn = NearestNeighbors(n_neighbors=1, metric="euclidean")
+    nn.fit(positive_reference.to_numpy())
+    distances, _ = nn.kneighbors(candidate_reference.to_numpy())
+    distances = distances.reshape(-1)
+    cutoff = np.quantile(distances, far_quantile)
+    far_mask = distances >= cutoff
+    candidate_pool = pseudo_absence_candidates.loc[far_mask].copy()
+    if candidate_pool.empty:
+        candidate_pool = pseudo_absence_candidates.copy()
+
+    sample_size = max(1, int(round(len(positives) * ratio)))
+    replace = candidate_pool.shape[0] < sample_size
+    chosen_index = rng.choice(candidate_pool.index.to_numpy(), size=sample_size, replace=replace)
+    sampled = candidate_pool.loc[chosen_index].copy().reset_index(drop=True)
+    sampled[target_column] = 0
+    sampled["ID"] = [f"PA_{rng.integers(0, 1_000_000_000):09d}" for _ in range(sampled.shape[0])]
+    sampled["spatial_group"] = "pseudo_absence"
+    for column in train_fold.columns:
+        if column not in sampled.columns:
+            sampled[column] = np.nan
+    return sampled[train_fold.columns]
+
+
+def _run_environmental_pseudo_model(
+    model_name: str,
+    estimator_factory: EstimatorFactory,
+    train_frame: pd.DataFrame,
+    test_frame: pd.DataFrame,
+    pseudo_absence_candidates: pd.DataFrame | None,
+    feature_columns: list[str],
+    target_column: str,
+    splitter: StratifiedGroupKFold,
+    groups: pd.Series,
+    config: ModelConfig,
+) -> dict[str, object]:
+    oof_probabilities = np.zeros(train_frame.shape[0], dtype=np.float64)
+    test_fold_probabilities: list[np.ndarray] = []
+    fold_rows: list[dict[str, float | int]] = []
+    y = train_frame[target_column].to_numpy()
+    X_test = test_frame[feature_columns]
+
+    for fold_index, (train_index, valid_index) in enumerate(splitter.split(train_frame[feature_columns], y, groups=groups), start=1):
+        LOGGER.info(
+            "Environmental pseudo model %s | fold %s/%s | train_rows=%s | valid_rows=%s",
+            model_name,
+            fold_index,
+            config.n_splits,
+            len(train_index),
+            len(valid_index),
+        )
+        train_fold = train_frame.iloc[train_index].reset_index(drop=True)
+        rng = np.random.default_rng(config.random_state + fold_index * 12345)
+        pseudo_negatives = _select_environmental_pseudo_absences(
+            train_fold=train_fold,
+            pseudo_absence_candidates=pseudo_absence_candidates,
+            feature_columns=feature_columns,
+            target_column=target_column,
+            ratio=config.pseudo_absence_positive_ratio,
+            far_quantile=config.pseudo_absence_far_quantile,
+            rng=rng,
+        )
+        augmented_train = (
+            pd.concat([train_fold, pseudo_negatives], axis=0)
+            .sample(frac=1.0, random_state=int(rng.integers(0, 1_000_000_000)))
+            .reset_index(drop=True)
+            if not pseudo_negatives.empty
+            else train_fold
+        )
+
+        estimator = estimator_factory()
+        X_train_fold = augmented_train[feature_columns]
+        y_train_fold = augmented_train[target_column].to_numpy()
+        X_valid_fold = train_frame.iloc[valid_index][feature_columns]
+        y_valid_fold = train_frame.iloc[valid_index][target_column].to_numpy()
+
+        if "catboost" in model_name:
+            estimator.fit(X_train_fold, y_train_fold, eval_set=(X_valid_fold, y_valid_fold), use_best_model=True)
+        else:
+            estimator.fit(X_train_fold, y_train_fold)
+
+        valid_probabilities = predict_probabilities(estimator, X_valid_fold)
+        test_probabilities = predict_probabilities(estimator, X_test)
+        oof_probabilities[valid_index] = valid_probabilities
+        test_fold_probabilities.append(test_probabilities)
+        fold_rows.append(
+            {
+                "fold": fold_index,
+                "f1_at_0_50": float(f1_score(y_valid_fold, (valid_probabilities >= 0.50).astype(int))),
+            }
+        )
+        LOGGER.info(
+            "Environmental pseudo model %s | fold %s complete | f1_at_0_50=%.4f",
+            model_name,
+            fold_index,
+            fold_rows[-1]["f1_at_0_50"],
+        )
+
+    threshold, oof_f1 = optimize_threshold(
+        y_true=y,
+        probabilities=oof_probabilities,
+        threshold_min=config.optimize_threshold_min,
+        threshold_max=config.optimize_threshold_max,
+        threshold_step=config.optimize_threshold_step,
+    )
+    mean_test_probability = np.mean(np.vstack(test_fold_probabilities), axis=0)
+    LOGGER.info(
+        "Environmental pseudo model %s complete | optimized_threshold=%.2f | oof_f1=%.4f",
+        model_name,
+        threshold,
+        oof_f1,
+    )
+    return {
+        "model_name": model_name,
+        "oof_probabilities": oof_probabilities,
+        "test_probabilities": mean_test_probability,
+        "threshold": threshold,
+        "oof_f1": oof_f1,
+        "fold_rows": fold_rows,
+    }
+
+
 def _candidate_record(
     name: str,
     probabilities: np.ndarray,
@@ -606,7 +807,7 @@ def _run_stacking_candidates(
 
 def run_baseline_suite(config: ModelConfig) -> ModelRunArtifacts:
     output_dir = ensure_directory(config.output_dir)
-    train_frame, test_frame, manifest = load_feature_tables(config.feature_dir)
+    train_frame, test_frame, pseudo_absence_candidates, manifest = load_feature_tables(config.feature_dir)
     feature_columns = select_feature_columns(train_frame, config.protected_columns)
     LOGGER.info(
         "Starting CPU baseline suite | output_dir=%s | feature_count=%s | n_splits=%s",
@@ -622,6 +823,7 @@ def run_baseline_suite(config: ModelConfig) -> ModelRunArtifacts:
     y_true = train_frame[config.target_column].to_numpy()
 
     baseline_factories = get_baseline_model_factories(config.random_state)
+    baseline_factories.update(get_multi_seed_model_factories(config))
     for model_name, estimator_factory in baseline_factories.items():
         with log_step(LOGGER, f"Train baseline model {model_name}"):
             model_outputs[model_name] = _run_cross_validated_model(
@@ -646,6 +848,25 @@ def run_baseline_suite(config: ModelConfig) -> ModelRunArtifacts:
                 estimator_factory=baseline_factories[base_model_name],
                 train_frame=train_frame,
                 test_frame=test_frame,
+                feature_columns=feature_columns,
+                target_column=config.target_column,
+                splitter=splitter,
+                groups=groups,
+                config=config,
+            )
+
+    for pseudo_model_name in config.pseudo_absence_models:
+        base_factory = baseline_factories.get(pseudo_model_name)
+        if base_factory is None:
+            continue
+        env_model_name = f"environmental_pseudo_{pseudo_model_name}"
+        with log_step(LOGGER, f"Train environmental pseudo model {env_model_name}"):
+            model_outputs[env_model_name] = _run_environmental_pseudo_model(
+                model_name=env_model_name,
+                estimator_factory=base_factory,
+                train_frame=train_frame,
+                test_frame=test_frame,
+                pseudo_absence_candidates=pseudo_absence_candidates,
                 feature_columns=feature_columns,
                 target_column=config.target_column,
                 splitter=splitter,
@@ -684,7 +905,7 @@ def run_baseline_suite(config: ModelConfig) -> ModelRunArtifacts:
     )
 
     model_dir = ensure_directory(output_dir / "models")
-    for name, output in model_outputs.items():
+    for name, output in candidate_outputs.items():
         oof_frame = pd.DataFrame(
             {
                 config.id_column: train_frame[config.id_column],

@@ -84,6 +84,7 @@ class TPUConfig:
     optimize_threshold_step: float = 0.01
     architectures: tuple[str, ...] = ("dense_mlp", "residual_mlp")
     save_fold_models: bool = True
+    require_tpu: bool = True
     protected_columns: tuple[str, ...] = (
         "ID",
         "Latitude",

@@ -13,4 +13,5 @@ adlfs==2024.7.0
 rioxarray>=0.17.0
 zarr>=2.18.0
 catboost>=1.2.7
+xgboost>=2.0.0
 tensorflow>=2.15.0

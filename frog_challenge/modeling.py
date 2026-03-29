@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 import logging
 from pathlib import Path
 from typing import Callable
@@ -165,6 +166,31 @@ def _catboost_factory(random_state: int) -> EstimatorFactory | None:
     return factory
 
 
+def _xgboost_factory(random_state: int) -> EstimatorFactory | None:
+    try:
+        from xgboost import XGBClassifier
+    except ImportError:
+        return None
+
+    def factory() -> object:
+        return XGBClassifier(
+            objective="binary:logistic",
+            eval_metric="logloss",
+            n_estimators=900,
+            max_depth=6,
+            learning_rate=0.03,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            min_child_weight=2,
+            reg_lambda=1.5,
+            random_state=random_state,
+            tree_method="hist",
+            n_jobs=-1,
+        )
+
+    return factory
+
+
 def get_baseline_model_factories(random_state: int) -> dict[str, EstimatorFactory]:
     factories: dict[str, EstimatorFactory] = {
         "logistic_regression": _logistic_factory(random_state),
@@ -174,6 +200,9 @@ def get_baseline_model_factories(random_state: int) -> dict[str, EstimatorFactor
     catboost_factory = _catboost_factory(random_state)
     if catboost_factory is not None:
         factories["catboost"] = catboost_factory
+    xgboost_factory = _xgboost_factory(random_state)
+    if xgboost_factory is not None:
+        factories["xgboost"] = xgboost_factory
     return factories
 
 
@@ -310,6 +339,94 @@ def _candidate_record(
     }
 
 
+def _best_weighted_ensemble_candidates(
+    model_outputs: dict[str, dict[str, object]],
+    y_true: np.ndarray,
+    config: ModelConfig,
+) -> dict[str, dict[str, object]]:
+    weighted_candidates: dict[str, dict[str, object]] = {}
+    ranked = sorted(model_outputs.values(), key=lambda item: float(item["oof_f1"]), reverse=True)[:4]
+    if len(ranked) < 2:
+        return weighted_candidates
+
+    best_pair_candidate: dict[str, object] | None = None
+    best_pair_name: str | None = None
+    for left, right in combinations(ranked, 2):
+        left_name = str(left["model_name"])
+        right_name = str(right["model_name"])
+        left_oof = np.asarray(left["oof_probabilities"])
+        right_oof = np.asarray(right["oof_probabilities"])
+        left_test = np.asarray(left["test_probabilities"])
+        right_test = np.asarray(right["test_probabilities"])
+
+        for left_weight in np.arange(0.1, 1.0, 0.1):
+            right_weight = 1.0 - left_weight
+            candidate_name = f"weighted_{left_name}_{left_weight:.1f}__{right_name}_{right_weight:.1f}"
+            candidate = _candidate_record(
+                candidate_name,
+                left_weight * left_oof + right_weight * right_oof,
+                left_weight * left_test + right_weight * right_test,
+                y_true,
+                config,
+            )
+            if best_pair_candidate is None or float(candidate["oof_f1"]) > float(best_pair_candidate["oof_f1"]):
+                best_pair_candidate = candidate
+                best_pair_name = candidate_name
+
+    if best_pair_candidate is not None and best_pair_name is not None:
+        weighted_candidates[best_pair_name] = best_pair_candidate
+        LOGGER.info(
+            "Best weighted pair ensemble | name=%s | oof_f1=%.4f",
+            best_pair_name,
+            float(best_pair_candidate["oof_f1"]),
+        )
+
+    if len(ranked) >= 3:
+        best_triplet_candidate: dict[str, object] | None = None
+        best_triplet_name: str | None = None
+        for first, second, third in combinations(ranked, 3):
+            first_name = str(first["model_name"])
+            second_name = str(second["model_name"])
+            third_name = str(third["model_name"])
+            first_oof = np.asarray(first["oof_probabilities"])
+            second_oof = np.asarray(second["oof_probabilities"])
+            third_oof = np.asarray(third["oof_probabilities"])
+            first_test = np.asarray(first["test_probabilities"])
+            second_test = np.asarray(second["test_probabilities"])
+            third_test = np.asarray(third["test_probabilities"])
+
+            for first_weight in np.arange(0.2, 0.8, 0.2):
+                for second_weight in np.arange(0.2, 0.8, 0.2):
+                    third_weight = 1.0 - first_weight - second_weight
+                    if third_weight <= 0:
+                        continue
+                    candidate_name = (
+                        f"weighted_{first_name}_{first_weight:.1f}__"
+                        f"{second_name}_{second_weight:.1f}__"
+                        f"{third_name}_{third_weight:.1f}"
+                    )
+                    candidate = _candidate_record(
+                        candidate_name,
+                        first_weight * first_oof + second_weight * second_oof + third_weight * third_oof,
+                        first_weight * first_test + second_weight * second_test + third_weight * third_test,
+                        y_true,
+                        config,
+                    )
+                    if best_triplet_candidate is None or float(candidate["oof_f1"]) > float(best_triplet_candidate["oof_f1"]):
+                        best_triplet_candidate = candidate
+                        best_triplet_name = candidate_name
+
+        if best_triplet_candidate is not None and best_triplet_name is not None:
+            weighted_candidates[best_triplet_name] = best_triplet_candidate
+            LOGGER.info(
+                "Best weighted triplet ensemble | name=%s | oof_f1=%.4f",
+                best_triplet_name,
+                float(best_triplet_candidate["oof_f1"]),
+            )
+
+    return weighted_candidates
+
+
 def run_baseline_suite(config: ModelConfig) -> ModelRunArtifacts:
     output_dir = ensure_directory(config.output_dir)
     train_frame, test_frame, manifest = load_feature_tables(config.feature_dir)
@@ -357,6 +474,8 @@ def run_baseline_suite(config: ModelConfig) -> ModelRunArtifacts:
                 y_true,
                 config,
             )
+
+    candidate_outputs.update(_best_weighted_ensemble_candidates(model_outputs, y_true, config))
 
     best_name, best_output = max(candidate_outputs.items(), key=lambda item: float(item[1]["oof_f1"]))
     LOGGER.info(

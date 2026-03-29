@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import os
 from pathlib import Path
 
 import joblib
@@ -31,16 +32,45 @@ class TPURunArtifacts:
 def create_tpu_strategy():
     import tensorflow as tf
 
-    try:
-        resolver = tf.distribute.cluster_resolver.TPUClusterResolver()
-        tf.config.experimental_connect_to_cluster(resolver)
-        tf.tpu.experimental.initialize_tpu_system(resolver)
-        strategy = tf.distribute.TPUStrategy(resolver)
-        accelerator = "TPU"
-    except Exception:
-        strategy = tf.distribute.get_strategy()
-        accelerator = "CPU_OR_GPU"
-    return tf, strategy, accelerator
+    attempts: list[tuple[str, str | None]] = []
+    env_tpu_name = os.getenv("TPU_NAME")
+    if env_tpu_name:
+        attempts.append(("env_tpu_name", env_tpu_name))
+    attempts.extend(
+        [
+            ("local", "local"),
+            ("empty", ""),
+            ("auto", None),
+        ]
+    )
+
+    errors: list[str] = []
+    for label, tpu_value in attempts:
+        try:
+            LOGGER.info("Trying TPU initialization mode=%s value=%s", label, tpu_value)
+            if tpu_value is None:
+                resolver = tf.distribute.cluster_resolver.TPUClusterResolver.connect()
+            else:
+                resolver = tf.distribute.cluster_resolver.TPUClusterResolver.connect(tpu=tpu_value)
+            strategy = tf.distribute.TPUStrategy(resolver)
+            logical_tpus = tf.config.list_logical_devices("TPU")
+            metadata = resolver.get_tpu_system_metadata()
+            LOGGER.info(
+                "TPU initialized | mode=%s | replicas=%s | logical_tpu_count=%s | num_hosts=%s | num_cores=%s",
+                label,
+                strategy.num_replicas_in_sync,
+                len(logical_tpus),
+                getattr(metadata, "num_hosts", "unknown"),
+                getattr(metadata, "num_cores", "unknown"),
+            )
+            return tf, strategy, "TPU", {"mode": label, "logical_tpu_count": len(logical_tpus)}
+        except Exception as exc:
+            error_message = f"{label}: {type(exc).__name__}: {exc}"
+            errors.append(error_message)
+            LOGGER.warning("TPU initialization failed | %s", error_message)
+
+    strategy = tf.distribute.get_strategy()
+    return tf, strategy, "CPU_OR_GPU", {"errors": errors}
 
 
 def _dense_mlp(tf, input_dim: int, hidden_units: tuple[int, ...], dropout: float, learning_rate: float):
@@ -254,10 +284,16 @@ def run_tpu_suite(config: TPUConfig) -> TPURunArtifacts:
     feature_columns = select_feature_columns(train_frame, config.protected_columns)
     y_true = train_frame[config.target_column].to_numpy().astype(int)
 
-    tf, strategy, accelerator = create_tpu_strategy()
+    tf, strategy, accelerator, accelerator_details = create_tpu_strategy()
+    if accelerator != "TPU" and config.require_tpu:
+        raise RuntimeError(
+            "TPU stage was requested, but no TPU was initialized. "
+            f"Initialization attempts: {accelerator_details.get('errors', [])}"
+        )
     LOGGER.info(
-        "Starting TPU suite | accelerator=%s | output_dir=%s | feature_count=%s | architectures=%s",
+        "Starting TPU suite | accelerator=%s | accelerator_details=%s | output_dir=%s | feature_count=%s | architectures=%s",
         accelerator,
+        accelerator_details,
         output_dir,
         len(feature_columns),
         list(config.architectures),

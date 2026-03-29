@@ -4,26 +4,23 @@
 
 The repo now contains the challenge CSV files and a dedicated Kaggle bootstrap script. The normal Kaggle flow is:
 
-1. Open a notebook from this repo in Kaggle.
+1. Open `notebooks/run_on_kaggle.ipynb` in Kaggle.
 2. Run all cells.
 3. Let the notebook download `kaggle_bootstrap.py`, which then clones the repo, installs dependencies, uses the repo-local CSV files, and writes artifacts to `/kaggle/working/artifacts`.
 
 No separate Kaggle dataset is required for the source training and test data.
 
-## Recommended notebooks
+## Notebook behavior
 
-- `notebooks/02_baseline_models_kaggle.ipynb`
-  - Run on CPU
-  - Produces a valid baseline submission in one run
-- `notebooks/03_tpu_train_kaggle.ipynb`
-  - Run on TPU
-  - Builds features, trains TPU models, runs CPU baselines, compares both, and writes the final submission in one run
-- `notebooks/00_kaggle_github_launcher.ipynb`
-  - Generic dispatcher if you want to select `feature`, `baseline`, `tpu`, or `finalize`
+`notebooks/run_on_kaggle.ipynb` is now the only Kaggle notebook in the repo.
+
+- Default `STAGE` is `tpu`
+- That full run builds features, trains TPU models, runs CPU baselines, compares both, and writes `artifacts/baselines/final_submission.csv`
+- If you want a lighter run, change `STAGE` to `baseline`
 
 ## How bootstrap works
 
-Each notebook:
+The notebook:
 
 1. Downloads `kaggle_bootstrap.py` from GitHub
 2. Runs the bootstrap script with notebook-provided config

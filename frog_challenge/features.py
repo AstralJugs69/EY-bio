@@ -98,11 +98,15 @@ def open_terraclimate_dataset(config: FeatureBuildConfig) -> xr.Dataset:
         dataset = dataset.drop_vars("crs", errors="ignore")
         dataset = dataset.sel(time=slice(config.start_date, config.end_date))
         dataset = dataset[list(config.variables)]
+        # Quantile and trend calculations treat time as a core dimension.
+        # TerraClimate only spans 25 monthly steps for this challenge window,
+        # so forcing a single chunk on time is cheap and avoids dask core-dim errors.
+        dataset = dataset.chunk({"time": -1})
 
         mask_lon = (dataset.lon >= config.min_lon) & (dataset.lon <= config.max_lon)
         mask_lat = (dataset.lat >= config.min_lat) & (dataset.lat <= config.max_lat)
         dataset = dataset.where(mask_lon & mask_lat, drop=True)
-    LOGGER.info("Opened TerraClimate dataset | sizes=%s", dict(dataset.sizes))
+    LOGGER.info("Opened TerraClimate dataset | sizes=%s | chunks=%s", dict(dataset.sizes), dataset.chunksizes)
     return dataset
 
 

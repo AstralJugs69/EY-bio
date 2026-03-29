@@ -64,5 +64,8 @@ def log_step(logger: logging.Logger, label: str, **details: Any):
     started_at = time.perf_counter()
     try:
         yield
-    finally:
+    except Exception:
+        logger.exception("FAIL %s | elapsed=%.1fs", label, time.perf_counter() - started_at)
+        raise
+    else:
         logger.info("DONE %s | elapsed=%.1fs", label, time.perf_counter() - started_at)

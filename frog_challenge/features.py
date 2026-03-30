@@ -277,7 +277,10 @@ def sample_pseudo_absence_candidates(
         config.pseudo_absence_max_candidates,
     )
     candidate_grid = feature_dataset.isel(lat=slice(None, None, stride), lon=slice(None, None, stride))
-    candidate_frame = candidate_grid.to_dataframe().reset_index()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="All-NaN slice encountered", category=RuntimeWarning)
+        warnings.filterwarnings("ignore", message="invalid value encountered in divide", category=RuntimeWarning)
+        candidate_frame = candidate_grid.to_dataframe().reset_index()
     candidate_frame = candidate_frame.dropna(how="all", subset=list(feature_dataset.data_vars))
     candidate_frame = candidate_frame.rename(columns={"lat": "Latitude", "lon": "Longitude"})
     if candidate_frame.shape[0] > config.pseudo_absence_max_candidates:
@@ -287,6 +290,39 @@ def sample_pseudo_absence_candidates(
         ).reset_index(drop=True)
     LOGGER.info("Prepared pseudo-absence candidates | rows=%s", candidate_frame.shape[0])
     return candidate_frame.apply(lambda column: column.map(coerce_native))
+
+
+def sample_monthly_sequence_features(
+    dataset: xr.Dataset,
+    points_frame: pd.DataFrame,
+    variables: tuple[str, ...],
+) -> pd.DataFrame:
+    import xarray as xr
+
+    selected_variables = [variable for variable in variables if variable in dataset.data_vars]
+    if not selected_variables:
+        return pd.DataFrame(index=points_frame.index)
+
+    LOGGER.info("Sampling raw monthly sequence features | variables=%s | point_rows=%s", selected_variables, points_frame.shape[0])
+    lat_indexer = xr.DataArray(points_frame["Latitude"].to_numpy(), dims="point")
+    lon_indexer = xr.DataArray(points_frame["Longitude"].to_numpy(), dims="point")
+    sampled = dataset[selected_variables].sel(lat=lat_indexer, lon=lon_indexer, method="nearest").load()
+    time_labels = pd.to_datetime(sampled["time"].values).strftime("%Y_%m").tolist()
+
+    columns: dict[str, np.ndarray] = {}
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="All-NaN slice encountered", category=RuntimeWarning)
+        warnings.filterwarnings("ignore", message="invalid value encountered in divide", category=RuntimeWarning)
+        for variable in selected_variables:
+            values = np.asarray(sampled[variable].transpose("point", "time").values)
+            for time_index, time_label in enumerate(time_labels):
+                columns[f"{variable}_{time_label}"] = values[:, time_index]
+            columns[f"{variable}_delta_start_end"] = values[:, -1] - values[:, 0]
+            columns[f"{variable}_recent3_mean"] = np.nanmean(values[:, -3:], axis=1)
+            columns[f"{variable}_recent6_std"] = np.nanstd(values[:, -6:], axis=1)
+
+    monthly_frame = pd.DataFrame(columns, index=points_frame.index)
+    return monthly_frame.apply(lambda column: column.map(coerce_native))
 
 
 def _drop_all_null_feature_columns(
@@ -334,6 +370,11 @@ def build_feature_artifacts(config: FeatureBuildConfig) -> FeatureArtifacts:
             with log_step(LOGGER, "Sample features at coordinates", coordinate_rows=coordinate_frame.shape[0]):
                 sampled_coordinates = pd.concat(
                     [coordinate_frame, sample_feature_dataset(feature_dataset, coordinate_frame)],
+                    axis=1,
+                )
+            with log_step(LOGGER, "Sample raw monthly sequence features", variables=list(config.raw_monthly_variables)):
+                sampled_coordinates = pd.concat(
+                    [sampled_coordinates, sample_monthly_sequence_features(dataset, coordinate_frame, config.raw_monthly_variables)],
                     axis=1,
                 )
             with log_step(LOGGER, "Sample pseudo-absence candidates"):

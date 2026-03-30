@@ -40,6 +40,7 @@ class FeatureBuildConfig:
     neighborhood_sizes: tuple[int, ...] = (3, 5, 7)
     quantiles: tuple[float, float] = (0.10, 0.90)
     spatial_group_size_degrees: float = 0.5
+    raw_monthly_variables: tuple[str, ...] = ("soil", "ppt", "vap", "tmin", "tmax", "def", "pdsi", "vpd")
     pseudo_absence_grid_stride: int = 2
     pseudo_absence_max_candidates: int = 20000
 

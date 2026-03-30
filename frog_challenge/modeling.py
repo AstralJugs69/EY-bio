@@ -759,6 +759,68 @@ def _best_weighted_ensemble_candidates(
     return weighted_candidates
 
 
+def _rank_normalize(values: np.ndarray) -> np.ndarray:
+    order = np.argsort(np.argsort(values))
+    return (order + 1).astype(np.float64) / len(values)
+
+
+def _best_rank_ensemble_candidates(
+    model_outputs: dict[str, dict[str, object]],
+    y_true: np.ndarray,
+    config: ModelConfig,
+) -> dict[str, dict[str, object]]:
+    rank_candidates: dict[str, dict[str, object]] = {}
+    ranked = sorted(model_outputs.values(), key=lambda item: float(item["oof_f1"]), reverse=True)[:5]
+    if len(ranked) < 2:
+        return rank_candidates
+
+    best_pair_candidate: dict[str, object] | None = None
+    best_pair_name: str | None = None
+    for left, right in combinations(ranked, 2):
+        left_name = str(left["model_name"])
+        right_name = str(right["model_name"])
+        ensemble_name = f"rank_{left_name}__{right_name}"
+        ensemble_oof = (_rank_normalize(np.asarray(left["oof_probabilities"])) + _rank_normalize(np.asarray(right["oof_probabilities"]))) / 2.0
+        ensemble_test = (_rank_normalize(np.asarray(left["test_probabilities"])) + _rank_normalize(np.asarray(right["test_probabilities"]))) / 2.0
+        candidate = _candidate_record(ensemble_name, ensemble_oof, ensemble_test, y_true, config)
+        if best_pair_candidate is None or float(candidate["oof_f1"]) > float(best_pair_candidate["oof_f1"]):
+            best_pair_candidate = candidate
+            best_pair_name = ensemble_name
+
+    if best_pair_candidate is not None and best_pair_name is not None:
+        rank_candidates[best_pair_name] = best_pair_candidate
+        LOGGER.info("Best rank pair ensemble | name=%s | oof_f1=%.4f", best_pair_name, float(best_pair_candidate["oof_f1"]))
+
+    if len(ranked) >= 3:
+        best_triplet_candidate: dict[str, object] | None = None
+        best_triplet_name: str | None = None
+        for first, second, third in combinations(ranked, 3):
+            first_name = str(first["model_name"])
+            second_name = str(second["model_name"])
+            third_name = str(third["model_name"])
+            ensemble_name = f"rank_{first_name}__{second_name}__{third_name}"
+            ensemble_oof = (
+                _rank_normalize(np.asarray(first["oof_probabilities"]))
+                + _rank_normalize(np.asarray(second["oof_probabilities"]))
+                + _rank_normalize(np.asarray(third["oof_probabilities"]))
+            ) / 3.0
+            ensemble_test = (
+                _rank_normalize(np.asarray(first["test_probabilities"]))
+                + _rank_normalize(np.asarray(second["test_probabilities"]))
+                + _rank_normalize(np.asarray(third["test_probabilities"]))
+            ) / 3.0
+            candidate = _candidate_record(ensemble_name, ensemble_oof, ensemble_test, y_true, config)
+            if best_triplet_candidate is None or float(candidate["oof_f1"]) > float(best_triplet_candidate["oof_f1"]):
+                best_triplet_candidate = candidate
+                best_triplet_name = ensemble_name
+
+        if best_triplet_candidate is not None and best_triplet_name is not None:
+            rank_candidates[best_triplet_name] = best_triplet_candidate
+            LOGGER.info("Best rank triplet ensemble | name=%s | oof_f1=%.4f", best_triplet_name, float(best_triplet_candidate["oof_f1"]))
+
+    return rank_candidates
+
+
 def _stacking_model_factories(random_state: int) -> dict[str, EstimatorFactory]:
     return {
         "stacking_logistic_regression": _logistic_factory(random_state),
@@ -892,6 +954,7 @@ def run_baseline_suite(config: ModelConfig) -> ModelRunArtifacts:
             )
 
     candidate_outputs.update(_best_weighted_ensemble_candidates(model_outputs, y_true, config))
+    candidate_outputs.update(_best_rank_ensemble_candidates(model_outputs, y_true, config))
     stacking_outputs = _run_stacking_candidates(model_outputs, train_frame, test_frame, groups, config)
     candidate_outputs.update(stacking_outputs)
     model_outputs.update(stacking_outputs)

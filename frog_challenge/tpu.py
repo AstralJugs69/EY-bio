@@ -33,14 +33,14 @@ TPURunArtifacts = GPURunArtifacts
 
 
 def create_gpu_strategy():
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
     import tensorflow as tf
+    tf.get_logger().setLevel("ERROR")
 
     physical_gpus = tf.config.list_physical_devices("GPU")
-    logical_gpus = tf.config.list_logical_devices("GPU")
     LOGGER.info(
-        "Visible GPU devices | physical=%s | logical=%s | names=%s",
+        "Visible GPU devices | physical=%s | names=%s",
         len(physical_gpus),
-        len(logical_gpus),
         [device.name for device in physical_gpus],
     )
 
@@ -52,9 +52,10 @@ def create_gpu_strategy():
 
     if physical_gpus:
         strategy = tf.distribute.MirroredStrategy()
+        logical_gpus = tf.config.list_logical_devices("GPU")
         return tf, strategy, "GPU", {
             "physical_gpu_count": len(physical_gpus),
-            "logical_gpu_count": len(tf.config.list_logical_devices("GPU")),
+            "logical_gpu_count": len(logical_gpus),
             "replicas": strategy.num_replicas_in_sync,
         }
 

@@ -30,6 +30,7 @@ def ensure_feature_artifacts(
     data_root: Path,
     train_path: Path | None = None,
     test_path: Path | None = None,
+    pseudo_absence_cache_dir: Path | None = None,
 ) -> Path:
     if feature_artifacts_exist(feature_dir):
         LOGGER.info("Using existing feature artifacts in %s", feature_dir)
@@ -53,6 +54,7 @@ def ensure_feature_artifacts(
             train_path=resolved_train,
             test_path=resolved_test,
             output_dir=feature_dir,
+            pseudo_absence_cache_dir=pseudo_absence_cache_dir,
         )
     )
     LOGGER.info("Feature artifacts created in %s", feature_dir)

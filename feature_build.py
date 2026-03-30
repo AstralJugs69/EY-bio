@@ -17,6 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-path", type=Path, default=Path("Training_Data.csv"))
     parser.add_argument("--test-path", type=Path, default=Path("Test.csv"))
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts/features"))
+    parser.add_argument("--pseudo-absence-cache-dir", type=Path, default=None)
     parser.add_argument("--start-date", default="2017-11-01")
     parser.add_argument("--end-date", default="2019-11-01")
     parser.add_argument("--min-lon", type=float, default=139.94)
@@ -39,6 +40,7 @@ def main() -> int:
         train_path=args.train_path,
         test_path=args.test_path,
         output_dir=args.output_dir,
+        pseudo_absence_cache_dir=args.pseudo_absence_cache_dir,
         start_date=args.start_date,
         end_date=args.end_date,
         min_lon=args.min_lon,

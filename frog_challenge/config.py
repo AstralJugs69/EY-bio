@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 
 TERRACLIMATE_VARIABLES: tuple[str, ...] = (
@@ -43,6 +44,7 @@ class FeatureBuildConfig:
     raw_monthly_variables: tuple[str, ...] = ("soil", "ppt", "vap", "tmin", "tmax", "def", "pdsi", "vpd")
     pseudo_absence_grid_stride: int = 2
     pseudo_absence_max_candidates: int = 20000
+    pseudo_absence_cache_dir: Optional[Path] = None
 
 
 @dataclass(slots=True)

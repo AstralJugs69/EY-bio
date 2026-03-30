@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import importlib.util
 import logging
 from pathlib import Path
@@ -11,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from .config import FeatureBuildConfig, SEASONS
-from .utils import coerce_native, ensure_directory, log_step, write_dataframe_parquet, write_json
+from .utils import coerce_native, ensure_directory, log_step, read_dataframe_parquet, write_dataframe_parquet, write_json
 
 if TYPE_CHECKING:
     import xarray as xr
@@ -130,6 +131,23 @@ def _linear_slope(values: np.ndarray) -> float:
 
 def _quantile_name(quantile: float) -> str:
     return f"p{int(round(quantile * 100)):02d}"
+
+
+def _pseudo_absence_cache_key(config: FeatureBuildConfig) -> str:
+    payload = {
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "start_date": config.start_date,
+        "end_date": config.end_date,
+        "bounds": [config.min_lon, config.min_lat, config.max_lon, config.max_lat],
+        "variables": list(config.variables),
+        "last_n_months": config.last_n_months,
+        "neighborhood_sizes": list(config.neighborhood_sizes),
+        "quantiles": list(config.quantiles),
+        "raw_monthly_variables": list(config.raw_monthly_variables),
+        "pseudo_absence_grid_stride": config.pseudo_absence_grid_stride,
+        "pseudo_absence_max_candidates": config.pseudo_absence_max_candidates,
+    }
+    return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()[:16]
 
 
 def _seasonal_mean(variable: xr.DataArray, season: str) -> xr.DataArray:
@@ -292,6 +310,28 @@ def sample_pseudo_absence_candidates(
     return candidate_frame.apply(lambda column: column.map(coerce_native))
 
 
+def get_or_build_pseudo_absence_candidates(
+    feature_dataset: xr.Dataset,
+    config: FeatureBuildConfig,
+) -> pd.DataFrame:
+    cache_dir = config.pseudo_absence_cache_dir
+    if cache_dir is None:
+        return sample_pseudo_absence_candidates(feature_dataset, config)
+
+    cache_dir = ensure_directory(cache_dir)
+    cache_key = _pseudo_absence_cache_key(config)
+    cache_path = cache_dir / f"pseudo_absence_candidates_{cache_key}.parquet"
+    if cache_path.exists():
+        LOGGER.info("Using cached pseudo-absence candidates from %s", cache_path)
+        return read_dataframe_parquet(cache_path)
+
+    LOGGER.info("Pseudo-absence cache miss | cache_path=%s", cache_path)
+    candidate_frame = sample_pseudo_absence_candidates(feature_dataset, config)
+    write_dataframe_parquet(cache_path, candidate_frame)
+    LOGGER.info("Cached pseudo-absence candidates at %s", cache_path)
+    return candidate_frame
+
+
 def sample_monthly_sequence_features(
     dataset: xr.Dataset,
     points_frame: pd.DataFrame,
@@ -378,7 +418,7 @@ def build_feature_artifacts(config: FeatureBuildConfig) -> FeatureArtifacts:
                     axis=1,
                 )
             with log_step(LOGGER, "Sample pseudo-absence candidates"):
-                pseudo_absence_candidates = sample_pseudo_absence_candidates(feature_dataset, config)
+                pseudo_absence_candidates = get_or_build_pseudo_absence_candidates(feature_dataset, config)
         finally:
             feature_dataset.close()
     finally:

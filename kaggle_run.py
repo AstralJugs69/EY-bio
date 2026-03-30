@@ -26,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-dir", type=Path, default=Path("artifacts/baselines"))
     parser.add_argument("--tpu-dir", type=Path, default=Path("artifacts/tpu"))
     parser.add_argument("--tpu-artifact-dir", type=Path, default=None)
+    parser.add_argument("--pseudo-absence-cache-dir", type=Path, default=None)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--patience", type=int, default=12)
@@ -63,7 +64,13 @@ def main() -> int:
         return 0
 
     if args.stage == "baseline":
-        ensure_feature_artifacts(args.feature_dir, args.data_root, train_path=train_path, test_path=test_path)
+        ensure_feature_artifacts(
+            args.feature_dir,
+            args.data_root,
+            train_path=train_path,
+            test_path=test_path,
+            pseudo_absence_cache_dir=args.pseudo_absence_cache_dir,
+        )
         artifacts = run_baseline_suite(
             ModelConfig(
                 feature_dir=args.feature_dir,
@@ -92,7 +99,13 @@ def main() -> int:
         return 0
 
     if args.stage in {"gpu", "tpu"}:
-        ensure_feature_artifacts(args.feature_dir, args.data_root, train_path=train_path, test_path=test_path)
+        ensure_feature_artifacts(
+            args.feature_dir,
+            args.data_root,
+            train_path=train_path,
+            test_path=test_path,
+            pseudo_absence_cache_dir=args.pseudo_absence_cache_dir,
+        )
         artifacts = run_gpu_suite(
             TPUConfig(
                 feature_dir=args.feature_dir,
@@ -121,7 +134,13 @@ def main() -> int:
         LOGGER.info("Kaggle runner finished gpu stage")
         return 0
 
-    ensure_feature_artifacts(args.feature_dir, args.data_root, train_path=train_path, test_path=test_path)
+    ensure_feature_artifacts(
+        args.feature_dir,
+        args.data_root,
+        train_path=train_path,
+        test_path=test_path,
+        pseudo_absence_cache_dir=args.pseudo_absence_cache_dir,
+    )
     final_choice = finalize_submission(
         feature_dir=args.feature_dir,
         output_dir=args.baseline_dir,

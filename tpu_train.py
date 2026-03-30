@@ -17,6 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=Path, default=Path("."))
     parser.add_argument("--feature-dir", type=Path, default=Path("artifacts/features"))
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts/tpu"))
+    parser.add_argument("--pseudo-absence-cache-dir", type=Path, default=None)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--patience", type=int, default=12)
@@ -35,7 +36,7 @@ def main() -> int:
         args.epochs,
         args.patience,
     )
-    ensure_feature_artifacts(args.feature_dir, args.data_root)
+    ensure_feature_artifacts(args.feature_dir, args.data_root, pseudo_absence_cache_dir=args.pseudo_absence_cache_dir)
     config = TPUConfig(
         feature_dir=args.feature_dir,
         output_dir=args.output_dir,

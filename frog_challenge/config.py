@@ -45,6 +45,8 @@ class FeatureBuildConfig:
     pseudo_absence_grid_stride: int = 2
     pseudo_absence_max_candidates: int = 20000
     pseudo_absence_cache_dir: Optional[Path] = None
+    extreme_quantile_low: float = 0.25
+    extreme_quantile_high: float = 0.75
 
 
 @dataclass(slots=True)
@@ -64,12 +66,24 @@ class ModelConfig:
     negative_bagging_models: tuple[str, ...] = ("extra_trees", "xgboost")
     negative_bagging_negative_fraction: float = 1.0
     pseudo_absence_models: tuple[str, ...] = ("extra_trees", "xgboost")
+    pseudo_absence_bags: int = 3
     pseudo_absence_positive_ratio: float = 1.0
+    pseudo_absence_geographic_buffer_degrees: float = 0.20
+    pseudo_absence_hard_fraction: float = 0.35
+    pseudo_absence_hard_lower_quantile: float = 0.10
+    pseudo_absence_hard_upper_quantile: float = 0.45
     pseudo_absence_far_quantile: float = 0.80
+    calibration_models: tuple[str, ...] = ("sigmoid", "isotonic")
+    calibration_top_k: int = 6
+    diversity_top_k: int = 6
+    diversity_max_correlation: float = 0.995
     stacking_models: tuple[str, ...] = ("logistic_regression", "hist_gradient_boosting")
     stacking_top_k: int = 5
     threshold_sweep_radius: float = 0.12
     threshold_sweep_step: float = 0.02
+    public_threshold_min: float = 0.45
+    public_threshold_max: float = 0.85
+    public_threshold_step: float = 0.02
     protected_columns: tuple[str, ...] = (
         "ID",
         "Latitude",

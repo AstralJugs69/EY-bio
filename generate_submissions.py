@@ -49,12 +49,33 @@ def _rank_normalize(values: np.ndarray) -> np.ndarray:
     return (order + 1).astype(np.float64) / len(values)
 
 
+def _prior_shift_adjust(probabilities: np.ndarray, source_prevalence: float, max_iter: int = 100, tol: float = 1e-6) -> tuple[np.ndarray, float]:
+    source_prevalence = float(np.clip(source_prevalence, 1e-4, 1.0 - 1e-4))
+    target_prevalence = source_prevalence
+    base_probabilities = np.clip(np.asarray(probabilities, dtype=np.float64), 1e-6, 1.0 - 1e-6)
+
+    for _ in range(max_iter):
+        numerator = base_probabilities * (target_prevalence / source_prevalence)
+        denominator = numerator + (1.0 - base_probabilities) * ((1.0 - target_prevalence) / (1.0 - source_prevalence))
+        adjusted = np.clip(numerator / denominator, 1e-6, 1.0 - 1e-6)
+        updated_prevalence = float(adjusted.mean())
+        if abs(updated_prevalence - target_prevalence) <= tol:
+            target_prevalence = updated_prevalence
+            break
+        target_prevalence = float(np.clip(updated_prevalence, 1e-4, 1.0 - 1e-4))
+    else:
+        adjusted = base_probabilities
+
+    return adjusted, target_prevalence
+
+
 def main() -> int:
     configure_logging()
     args = parse_args()
     output_dir = ensure_directory(args.output_dir or (args.baseline_dir / "posthoc_submission_sweeps"))
-    _, test_frame, _, _ = load_feature_tables(args.feature_dir)
+    train_frame, test_frame, _, _ = load_feature_tables(args.feature_dir)
     ids = test_frame["ID"]
+    source_prevalence = float(train_frame["Occurrence Status"].mean())
 
     baseline_summary = read_json(args.baseline_dir / "baseline_summary.json")
     baseline_prob_dir = args.baseline_dir / "models"
@@ -78,6 +99,15 @@ def main() -> int:
         for threshold in thresholds:
             output_path = output_dir / f"{model_name}_thr_{threshold:.2f}.csv"
             _write_submission(ids, probabilities, float(threshold), output_path)
+            written.append(str(output_path))
+
+    for model_name in ranked_baseline_names[:2]:
+        probabilities = baseline_test_probs[model_name]["probability"].to_numpy()
+        adjusted_probs, estimated_prevalence = _prior_shift_adjust(probabilities, source_prevalence)
+        adjusted_name = f"prior_shift_{model_name}_p_{estimated_prevalence:.3f}"
+        for threshold in thresholds:
+            output_path = output_dir / f"{adjusted_name}_thr_{threshold:.2f}.csv"
+            _write_submission(ids, adjusted_probs, float(threshold), output_path)
             written.append(str(output_path))
 
     for left_name, right_name in combinations(ranked_baseline_names[:3], 2):

@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     import xarray as xr
 
 LOGGER = logging.getLogger(__name__)
-FEATURE_SCHEMA_VERSION = 2
+FEATURE_SCHEMA_VERSION = 3
 
 
 @dataclass(slots=True)
@@ -144,6 +144,8 @@ def _pseudo_absence_cache_key(config: FeatureBuildConfig) -> str:
         "neighborhood_sizes": list(config.neighborhood_sizes),
         "quantiles": list(config.quantiles),
         "raw_monthly_variables": list(config.raw_monthly_variables),
+        "extreme_quantile_low": config.extreme_quantile_low,
+        "extreme_quantile_high": config.extreme_quantile_high,
         "pseudo_absence_grid_stride": config.pseudo_absence_grid_stride,
         "pseudo_absence_max_candidates": config.pseudo_absence_max_candidates,
     }
@@ -165,10 +167,24 @@ def _safe_ratio(numerator: xr.DataArray, denominator: xr.DataArray, epsilon: flo
     return xr.where(np.abs(denominator) > epsilon, numerator / denominator, np.nan)
 
 
+def _longest_true_run(values: np.ndarray) -> int:
+    longest = 0
+    current = 0
+    for flag in np.asarray(values, dtype=bool):
+        if flag:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return int(longest)
+
+
 def compute_feature_dataset(dataset: xr.Dataset, config: FeatureBuildConfig) -> xr.Dataset:
     import xarray as xr
 
     feature_arrays: dict[str, xr.DataArray] = {}
+    q_low = float(config.extreme_quantile_low)
+    q_high = float(config.extreme_quantile_high)
 
     for index, variable_name in enumerate(config.variables, start=1):
         LOGGER.info(
@@ -261,6 +277,86 @@ def compute_feature_dataset(dataset: xr.Dataset, config: FeatureBuildConfig) -> 
         dim="time", skipna=True
     )
 
+    ppt_low_threshold = dataset["ppt"].quantile(q_low, dim="time", skipna=True)
+    ppt_high_threshold = dataset["ppt"].quantile(q_high, dim="time", skipna=True)
+    soil_low_threshold = dataset["soil"].quantile(q_low, dim="time", skipna=True)
+    tmax_high_threshold = dataset["tmax"].quantile(q_high, dim="time", skipna=True)
+    vpd_high_threshold = dataset["vpd"].quantile(q_high, dim="time", skipna=True)
+
+    dry_month_mask = dataset["ppt"] <= ppt_low_threshold
+    wet_month_mask = dataset["ppt"] >= ppt_high_threshold
+    low_soil_mask = dataset["soil"] <= soil_low_threshold
+    hot_month_mask = dataset["tmax"] >= tmax_high_threshold
+    high_vpd_mask = dataset["vpd"] >= vpd_high_threshold
+    water_deficit_mask = water_balance < 0
+    pdsi_drought_mask = dataset["pdsi"] < 0
+    hot_dry_mask = hot_month_mask & water_deficit_mask
+
+    feature_arrays["bio_ppt_dry_month_count"] = dry_month_mask.sum(dim="time")
+    feature_arrays["bio_ppt_wet_month_count"] = wet_month_mask.sum(dim="time")
+    feature_arrays["bio_soil_low_month_count"] = low_soil_mask.sum(dim="time")
+    feature_arrays["bio_tmax_hot_month_count"] = hot_month_mask.sum(dim="time")
+    feature_arrays["bio_vpd_high_month_count"] = high_vpd_mask.sum(dim="time")
+    feature_arrays["bio_water_deficit_month_count"] = water_deficit_mask.sum(dim="time")
+    feature_arrays["bio_water_surplus_month_count"] = (water_balance > 0).sum(dim="time")
+    feature_arrays["bio_pdsi_drought_month_count"] = pdsi_drought_mask.sum(dim="time")
+    feature_arrays["bio_hot_dry_month_count"] = hot_dry_mask.sum(dim="time")
+
+    feature_arrays["bio_ppt_longest_dry_spell"] = xr.apply_ufunc(
+        _longest_true_run,
+        dry_month_mask,
+        input_core_dims=[["time"]],
+        output_core_dims=[[]],
+        vectorize=True,
+        dask="parallelized",
+        output_dtypes=[np.int16],
+    )
+    feature_arrays["bio_water_deficit_longest_spell"] = xr.apply_ufunc(
+        _longest_true_run,
+        water_deficit_mask,
+        input_core_dims=[["time"]],
+        output_core_dims=[[]],
+        vectorize=True,
+        dask="parallelized",
+        output_dtypes=[np.int16],
+    )
+    feature_arrays["bio_pdsi_drought_longest_spell"] = xr.apply_ufunc(
+        _longest_true_run,
+        pdsi_drought_mask,
+        input_core_dims=[["time"]],
+        output_core_dims=[[]],
+        vectorize=True,
+        dask="parallelized",
+        output_dtypes=[np.int16],
+    )
+    feature_arrays["bio_hot_dry_longest_spell"] = xr.apply_ufunc(
+        _longest_true_run,
+        hot_dry_mask,
+        input_core_dims=[["time"]],
+        output_core_dims=[[]],
+        vectorize=True,
+        dask="parallelized",
+        output_dtypes=[np.int16],
+    )
+
+    for variable_name in ("ppt", "soil", "vpd", "def"):
+        variable = dataset[variable_name]
+        recent_mean = variable.isel(time=slice(-config.last_n_months, None)).mean(dim="time", skipna=True)
+        overall_mean = variable.mean(dim="time", skipna=True)
+        overall_std = variable.std(dim="time", skipna=True)
+        feature_arrays[f"bio_{variable_name}_recent{config.last_n_months}_anomaly"] = _safe_ratio(
+            recent_mean - overall_mean,
+            overall_std + 1e-6,
+        )
+
+    water_balance_mean = water_balance.mean(dim="time", skipna=True)
+    water_balance_std = water_balance.std(dim="time", skipna=True)
+    water_balance_recent_mean = water_balance.isel(time=slice(-config.last_n_months, None)).mean(dim="time", skipna=True)
+    feature_arrays[f"bio_water_balance_recent{config.last_n_months}_anomaly"] = _safe_ratio(
+        water_balance_recent_mean - water_balance_mean,
+        water_balance_std + 1e-6,
+    )
+
     feature_dataset = xr.Dataset(feature_arrays)
     LOGGER.info("Completed feature grid generation | feature_count=%s", len(feature_dataset.data_vars))
     return feature_dataset
@@ -294,7 +390,16 @@ def sample_pseudo_absence_candidates(
         stride,
         config.pseudo_absence_max_candidates,
     )
-    candidate_grid = feature_dataset.isel(lat=slice(None, None, stride), lon=slice(None, None, stride))
+    candidate_variables = [
+        name
+        for name in feature_dataset.data_vars
+        if name.startswith("bio_")
+        or name.endswith("_median")
+        or name.endswith("_seasonal_amp")
+        or name.endswith("_cv")
+        or name.endswith(f"_last{config.last_n_months}_mean")
+    ]
+    candidate_grid = feature_dataset[candidate_variables].isel(lat=slice(None, None, stride), lon=slice(None, None, stride))
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="All-NaN slice encountered", category=RuntimeWarning)
         warnings.filterwarnings("ignore", message="invalid value encountered in divide", category=RuntimeWarning)
@@ -531,6 +636,10 @@ def build_feature_artifacts(config: FeatureBuildConfig) -> FeatureArtifacts:
                 "bio_driest_quarter_soil",
                 "bio_water_balance_total",
                 "bio_water_balance_last6",
+                "extreme_month_counts",
+                "longest_event_spells",
+                f"recent{config.last_n_months}_anomaly",
+                "compound_hot_dry_counts",
             ],
             "dropped_all_null_columns": dropped_columns,
             "spatial_group_size_degrees": config.spatial_group_size_degrees,

@@ -203,14 +203,20 @@ def _write_threshold_sweep_submissions(
     step: float = 0.02,
 ) -> list[str]:
     sweep_dir = ensure_directory(output_dir / "submission_sweeps")
-    thresholds = np.arange(
+    local_thresholds = np.arange(
         max(0.05, center_threshold - radius),
         min(0.95, center_threshold + radius) + step,
         step,
     )
+    public_sweep_dir = ensure_directory(output_dir / "public_threshold_sweeps")
+    public_thresholds = np.arange(0.45, 0.85 + 0.02, 0.02)
     written: list[str] = []
-    for threshold in thresholds:
+    for threshold in local_thresholds:
         sweep_path = sweep_dir / f"{prefix}_thr_{threshold:.2f}.csv"
+        _write_final_submission(ids, probabilities, float(threshold), sweep_path)
+        written.append(str(sweep_path))
+    for threshold in public_thresholds:
+        sweep_path = public_sweep_dir / f"{prefix}_thr_{threshold:.2f}.csv"
         _write_final_submission(ids, probabilities, float(threshold), sweep_path)
         written.append(str(sweep_path))
     return written

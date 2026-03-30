@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import ExtraTreesClassifier, HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
+from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import f1_score
 from sklearn.neighbors import NearestNeighbors
@@ -84,6 +85,63 @@ def predict_probabilities(estimator: object, features: pd.DataFrame) -> np.ndarr
         raw = estimator.decision_function(features)
         return 1.0 / (1.0 + np.exp(-raw))
     raise TypeError(f"Estimator {type(estimator)!r} does not expose probabilities.")
+
+
+def _logit(values: np.ndarray, epsilon: float = 1e-6) -> np.ndarray:
+    clipped = np.clip(np.asarray(values, dtype=np.float64), epsilon, 1.0 - epsilon)
+    return np.log(clipped / (1.0 - clipped))
+
+
+def _safe_probability_correlation(left: np.ndarray, right: np.ndarray) -> float:
+    if np.allclose(left, left[0]) or np.allclose(right, right[0]):
+        return 1.0
+    correlation = np.corrcoef(left, right)[0, 1]
+    if not np.isfinite(correlation):
+        return 1.0
+    return float(correlation)
+
+
+def _select_diverse_model_outputs(
+    model_outputs: dict[str, dict[str, object]],
+    top_k: int,
+    max_correlation: float,
+) -> list[dict[str, object]]:
+    ranked_outputs = sorted(model_outputs.values(), key=lambda item: float(item["oof_f1"]), reverse=True)
+    selected: list[dict[str, object]] = []
+    selected_names: set[str] = set()
+    for candidate in ranked_outputs:
+        candidate_probs = np.asarray(candidate["oof_probabilities"])
+        if all(
+            abs(_safe_probability_correlation(candidate_probs, np.asarray(selected_item["oof_probabilities"]))) < max_correlation
+            for selected_item in selected
+        ):
+            selected.append(candidate)
+            selected_names.add(str(candidate["model_name"]))
+        if len(selected) >= top_k:
+            break
+
+    if len(selected) < min(top_k, len(ranked_outputs)):
+        for candidate in ranked_outputs:
+            if str(candidate["model_name"]) in selected_names:
+                continue
+            selected.append(candidate)
+            selected_names.add(str(candidate["model_name"]))
+            if len(selected) >= top_k:
+                break
+    return selected
+
+
+def _estimate_nearest_geographic_distance(
+    reference_points: pd.DataFrame,
+    candidate_points: pd.DataFrame,
+) -> np.ndarray:
+    if reference_points.empty or candidate_points.empty:
+        return np.array([], dtype=np.float64)
+
+    nn = NearestNeighbors(n_neighbors=1, metric="euclidean")
+    nn.fit(reference_points[["Latitude", "Longitude"]].to_numpy())
+    distances, _ = nn.kneighbors(candidate_points[["Latitude", "Longitude"]].to_numpy())
+    return distances.reshape(-1)
 
 
 def _logistic_factory(random_state: int) -> EstimatorFactory:
@@ -506,6 +564,10 @@ def _select_environmental_pseudo_absences(
     feature_columns: list[str],
     target_column: str,
     ratio: float,
+    geographic_buffer_degrees: float,
+    hard_fraction: float,
+    hard_lower_quantile: float,
+    hard_upper_quantile: float,
     far_quantile: float,
     rng: np.random.Generator,
 ) -> pd.DataFrame:
@@ -530,16 +592,53 @@ def _select_environmental_pseudo_absences(
     nn.fit(positive_reference.to_numpy())
     distances, _ = nn.kneighbors(candidate_reference.to_numpy())
     distances = distances.reshape(-1)
-    cutoff = np.quantile(distances, far_quantile)
-    far_mask = distances >= cutoff
-    candidate_pool = pseudo_absence_candidates.loc[far_mask].copy()
-    if candidate_pool.empty:
-        candidate_pool = pseudo_absence_candidates.copy()
+    geographic_distances = _estimate_nearest_geographic_distance(positives, pseudo_absence_candidates)
+    buffered_mask = geographic_distances >= geographic_buffer_degrees
+    if not buffered_mask.any():
+        buffered_mask = np.ones_like(distances, dtype=bool)
+
+    far_cutoff = np.quantile(distances, far_quantile)
+    hard_lower_cutoff = np.quantile(distances, hard_lower_quantile)
+    hard_upper_cutoff = np.quantile(distances, hard_upper_quantile)
+
+    far_pool = pseudo_absence_candidates.loc[buffered_mask & (distances >= far_cutoff)].copy()
+    if far_pool.empty:
+        far_pool = pseudo_absence_candidates.loc[buffered_mask].copy()
+    if far_pool.empty:
+        far_pool = pseudo_absence_candidates.copy()
+
+    hard_mask = buffered_mask & (distances >= hard_lower_cutoff) & (distances <= hard_upper_cutoff)
+    hard_pool = pseudo_absence_candidates.loc[hard_mask].copy()
+    if hard_pool.empty:
+        hard_pool = pseudo_absence_candidates.loc[buffered_mask & (distances < far_cutoff)].copy()
+    if hard_pool.empty:
+        hard_pool = far_pool.copy()
 
     sample_size = max(1, int(round(len(positives) * ratio)))
-    replace = candidate_pool.shape[0] < sample_size
-    chosen_index = rng.choice(candidate_pool.index.to_numpy(), size=sample_size, replace=replace)
-    sampled = candidate_pool.loc[chosen_index].copy().reset_index(drop=True)
+    hard_sample_size = min(sample_size, max(0, int(round(sample_size * hard_fraction))))
+    far_sample_size = max(0, sample_size - hard_sample_size)
+
+    sampled_frames: list[pd.DataFrame] = []
+    if far_sample_size > 0:
+        far_replace = far_pool.shape[0] < far_sample_size
+        far_index = rng.choice(far_pool.index.to_numpy(), size=far_sample_size, replace=far_replace)
+        sampled_frames.append(far_pool.loc[far_index].copy())
+    if hard_sample_size > 0:
+        hard_replace = hard_pool.shape[0] < hard_sample_size
+        hard_index = rng.choice(hard_pool.index.to_numpy(), size=hard_sample_size, replace=hard_replace)
+        sampled_frames.append(hard_pool.loc[hard_index].copy())
+
+    if sampled_frames:
+        sampled = pd.concat(sampled_frames, axis=0)
+    else:
+        fallback_replace = far_pool.shape[0] < sample_size
+        fallback_index = rng.choice(far_pool.index.to_numpy(), size=sample_size, replace=fallback_replace)
+        sampled = far_pool.loc[fallback_index].copy()
+
+    sampled = (
+        sampled.sample(frac=1.0, random_state=int(rng.integers(0, 1_000_000_000)))
+        .reset_index(drop=True)
+    )
     sampled[target_column] = 0
     sampled["ID"] = [f"PA_{rng.integers(0, 1_000_000_000):09d}" for _ in range(sampled.shape[0])]
     sampled["spatial_group"] = "pseudo_absence"
@@ -569,45 +668,54 @@ def _run_environmental_pseudo_model(
 
     for fold_index, (train_index, valid_index) in enumerate(splitter.split(train_frame[feature_columns], y, groups=groups), start=1):
         LOGGER.info(
-            "Environmental pseudo model %s | fold %s/%s | train_rows=%s | valid_rows=%s",
+            "Environmental pseudo model %s | fold %s/%s | train_rows=%s | valid_rows=%s | bags=%s",
             model_name,
             fold_index,
             config.n_splits,
             len(train_index),
             len(valid_index),
+            config.pseudo_absence_bags,
         )
         train_fold = train_frame.iloc[train_index].reset_index(drop=True)
-        rng = np.random.default_rng(config.random_state + fold_index * 12345)
-        pseudo_negatives = _select_environmental_pseudo_absences(
-            train_fold=train_fold,
-            pseudo_absence_candidates=pseudo_absence_candidates,
-            feature_columns=feature_columns,
-            target_column=target_column,
-            ratio=config.pseudo_absence_positive_ratio,
-            far_quantile=config.pseudo_absence_far_quantile,
-            rng=rng,
-        )
-        augmented_train = (
-            pd.concat([train_fold, pseudo_negatives], axis=0)
-            .sample(frac=1.0, random_state=int(rng.integers(0, 1_000_000_000)))
-            .reset_index(drop=True)
-            if not pseudo_negatives.empty
-            else train_fold
-        )
-
-        estimator = estimator_factory()
-        X_train_fold = augmented_train[feature_columns]
-        y_train_fold = augmented_train[target_column].to_numpy()
         X_valid_fold = train_frame.iloc[valid_index][feature_columns]
         y_valid_fold = train_frame.iloc[valid_index][target_column].to_numpy()
+        bag_valid_probabilities: list[np.ndarray] = []
+        bag_test_probabilities: list[np.ndarray] = []
+        for bag_index in range(config.pseudo_absence_bags):
+            rng = np.random.default_rng(config.random_state + fold_index * 12345 + bag_index)
+            pseudo_negatives = _select_environmental_pseudo_absences(
+                train_fold=train_fold,
+                pseudo_absence_candidates=pseudo_absence_candidates,
+                feature_columns=feature_columns,
+                target_column=target_column,
+                ratio=config.pseudo_absence_positive_ratio,
+                geographic_buffer_degrees=config.pseudo_absence_geographic_buffer_degrees,
+                hard_fraction=config.pseudo_absence_hard_fraction,
+                hard_lower_quantile=config.pseudo_absence_hard_lower_quantile,
+                hard_upper_quantile=config.pseudo_absence_hard_upper_quantile,
+                far_quantile=config.pseudo_absence_far_quantile,
+                rng=rng,
+            )
+            augmented_train = (
+                pd.concat([train_fold, pseudo_negatives], axis=0)
+                .sample(frac=1.0, random_state=int(rng.integers(0, 1_000_000_000)))
+                .reset_index(drop=True)
+                if not pseudo_negatives.empty
+                else train_fold
+            )
 
-        if "catboost" in model_name:
-            estimator.fit(X_train_fold, y_train_fold, eval_set=(X_valid_fold, y_valid_fold), use_best_model=True)
-        else:
-            estimator.fit(X_train_fold, y_train_fold)
+            estimator = estimator_factory()
+            X_train_fold = augmented_train[feature_columns]
+            y_train_fold = augmented_train[target_column].to_numpy()
+            if "catboost" in model_name:
+                estimator.fit(X_train_fold, y_train_fold, eval_set=(X_valid_fold, y_valid_fold), use_best_model=True)
+            else:
+                estimator.fit(X_train_fold, y_train_fold)
+            bag_valid_probabilities.append(predict_probabilities(estimator, X_valid_fold))
+            bag_test_probabilities.append(predict_probabilities(estimator, X_test))
 
-        valid_probabilities = predict_probabilities(estimator, X_valid_fold)
-        test_probabilities = predict_probabilities(estimator, X_test)
+        valid_probabilities = np.mean(np.vstack(bag_valid_probabilities), axis=0)
+        test_probabilities = np.mean(np.vstack(bag_test_probabilities), axis=0)
         oof_probabilities[valid_index] = valid_probabilities
         test_fold_probabilities.append(test_probabilities)
         fold_rows.append(
@@ -677,7 +785,11 @@ def _best_weighted_ensemble_candidates(
     config: ModelConfig,
 ) -> dict[str, dict[str, object]]:
     weighted_candidates: dict[str, dict[str, object]] = {}
-    ranked = sorted(model_outputs.values(), key=lambda item: float(item["oof_f1"]), reverse=True)[:4]
+    ranked = _select_diverse_model_outputs(
+        model_outputs,
+        top_k=min(4, config.diversity_top_k),
+        max_correlation=config.diversity_max_correlation,
+    )
     if len(ranked) < 2:
         return weighted_candidates
 
@@ -770,7 +882,11 @@ def _best_rank_ensemble_candidates(
     config: ModelConfig,
 ) -> dict[str, dict[str, object]]:
     rank_candidates: dict[str, dict[str, object]] = {}
-    ranked = sorted(model_outputs.values(), key=lambda item: float(item["oof_f1"]), reverse=True)[:5]
+    ranked = _select_diverse_model_outputs(
+        model_outputs,
+        top_k=min(5, config.diversity_top_k),
+        max_correlation=config.diversity_max_correlation,
+    )
     if len(ranked) < 2:
         return rank_candidates
 
@@ -837,7 +953,11 @@ def _run_stacking_candidates(
 ) -> dict[str, dict[str, object]]:
     ranked_model_names = [
         str(output["model_name"])
-        for output in sorted(model_outputs.values(), key=lambda item: float(item["oof_f1"]), reverse=True)[: config.stacking_top_k]
+        for output in _select_diverse_model_outputs(
+            model_outputs,
+            top_k=config.stacking_top_k,
+            max_correlation=config.diversity_max_correlation,
+        )
     ]
     if len(ranked_model_names) < 2:
         return {}
@@ -865,6 +985,92 @@ def _run_stacking_candidates(
                 config=config,
             )
     return stacking_outputs
+
+
+def _fit_sigmoid_calibrator(train_probabilities: np.ndarray, y_train: np.ndarray) -> Callable[[np.ndarray], np.ndarray]:
+    if len(np.unique(y_train)) < 2 or np.allclose(train_probabilities, train_probabilities[0]):
+        return lambda values: np.asarray(values, dtype=np.float64)
+    model = LogisticRegression(max_iter=1000, random_state=42)
+    model.fit(_logit(train_probabilities).reshape(-1, 1), y_train)
+    return lambda values: model.predict_proba(_logit(values).reshape(-1, 1))[:, 1]
+
+
+def _fit_isotonic_calibrator(train_probabilities: np.ndarray, y_train: np.ndarray) -> Callable[[np.ndarray], np.ndarray]:
+    if len(np.unique(y_train)) < 2 or np.allclose(train_probabilities, train_probabilities[0]):
+        return lambda values: np.asarray(values, dtype=np.float64)
+    model = IsotonicRegression(out_of_bounds="clip")
+    model.fit(train_probabilities, y_train)
+    return lambda values: model.transform(np.asarray(values, dtype=np.float64))
+
+
+def _cross_fit_calibrated_candidate(
+    base_output: dict[str, object],
+    y_true: np.ndarray,
+    groups: pd.Series,
+    config: ModelConfig,
+    method: str,
+) -> dict[str, object]:
+    base_name = str(base_output["model_name"])
+    base_oof = np.asarray(base_output["oof_probabilities"], dtype=np.float64)
+    base_test = np.asarray(base_output["test_probabilities"], dtype=np.float64)
+    splitter = StratifiedGroupKFold(n_splits=config.n_splits, shuffle=True, random_state=config.random_state + 17)
+    calibrated_oof = np.zeros_like(base_oof)
+    calibrated_test_folds: list[np.ndarray] = []
+
+    for train_index, valid_index in splitter.split(base_oof.reshape(-1, 1), y_true, groups=groups):
+        if method == "sigmoid":
+            calibrator = _fit_sigmoid_calibrator(base_oof[train_index], y_true[train_index])
+        elif method == "isotonic":
+            calibrator = _fit_isotonic_calibrator(base_oof[train_index], y_true[train_index])
+        else:
+            raise ValueError(f"Unsupported calibration method: {method}")
+        calibrated_oof[valid_index] = calibrator(base_oof[valid_index])
+        calibrated_test_folds.append(np.asarray(calibrator(base_test), dtype=np.float64))
+
+    calibrated_test = np.mean(np.vstack(calibrated_test_folds), axis=0)
+    return _candidate_record(
+        name=f"{base_name}_cal_{method}",
+        probabilities=calibrated_oof,
+        test_probabilities=calibrated_test,
+        y_true=y_true,
+        config=config,
+    )
+
+
+def _run_calibration_candidates(
+    model_outputs: dict[str, dict[str, object]],
+    y_true: np.ndarray,
+    groups: pd.Series,
+    config: ModelConfig,
+) -> dict[str, dict[str, object]]:
+    calibration_candidates: dict[str, dict[str, object]] = {}
+    selected_outputs = _select_diverse_model_outputs(
+        {
+            name: output
+            for name, output in model_outputs.items()
+            if "_cal_" not in name
+        },
+        top_k=config.calibration_top_k,
+        max_correlation=config.diversity_max_correlation,
+    )
+    if not selected_outputs:
+        return calibration_candidates
+
+    LOGGER.info(
+        "Building calibration candidates from base models %s",
+        [str(output["model_name"]) for output in selected_outputs],
+    )
+    for output in selected_outputs:
+        for method in config.calibration_models:
+            candidate = _cross_fit_calibrated_candidate(output, y_true, groups, config, method)
+            calibration_candidates[str(candidate["model_name"])] = candidate
+            LOGGER.info(
+                "Calibration candidate %s complete | oof_f1=%.4f | threshold=%.2f",
+                candidate["model_name"],
+                float(candidate["oof_f1"]),
+                float(candidate["threshold"]),
+            )
+    return calibration_candidates
 
 
 def run_baseline_suite(config: ModelConfig) -> ModelRunArtifacts:
@@ -936,11 +1142,15 @@ def run_baseline_suite(config: ModelConfig) -> ModelRunArtifacts:
                 config=config,
             )
 
-    sorted_models = sorted(model_outputs.values(), key=lambda item: item["oof_f1"], reverse=True)
+    diverse_models = _select_diverse_model_outputs(
+        model_outputs,
+        top_k=max(3, config.diversity_top_k),
+        max_correlation=config.diversity_max_correlation,
+    )
     candidate_outputs = dict(model_outputs)
     for ensemble_size in (2, 3):
-        if len(sorted_models) >= ensemble_size:
-            members = sorted_models[:ensemble_size]
+        if len(diverse_models) >= ensemble_size:
+            members = diverse_models[:ensemble_size]
             member_names = [str(member["model_name"]) for member in members]
             ensemble_name = "ensemble_" + "__".join(member_names)
             ensemble_oof = np.mean(np.vstack([member["oof_probabilities"] for member in members]), axis=0)
@@ -958,6 +1168,8 @@ def run_baseline_suite(config: ModelConfig) -> ModelRunArtifacts:
     stacking_outputs = _run_stacking_candidates(model_outputs, train_frame, test_frame, groups, config)
     candidate_outputs.update(stacking_outputs)
     model_outputs.update(stacking_outputs)
+    calibration_outputs = _run_calibration_candidates(candidate_outputs, y_true, groups, config)
+    candidate_outputs.update(calibration_outputs)
 
     best_name, best_output = max(candidate_outputs.items(), key=lambda item: float(item[1]["oof_f1"]))
     LOGGER.info(

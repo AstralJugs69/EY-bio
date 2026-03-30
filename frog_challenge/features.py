@@ -277,11 +277,11 @@ def compute_feature_dataset(dataset: xr.Dataset, config: FeatureBuildConfig) -> 
         dim="time", skipna=True
     )
 
-    ppt_low_threshold = dataset["ppt"].quantile(q_low, dim="time", skipna=True)
-    ppt_high_threshold = dataset["ppt"].quantile(q_high, dim="time", skipna=True)
-    soil_low_threshold = dataset["soil"].quantile(q_low, dim="time", skipna=True)
-    tmax_high_threshold = dataset["tmax"].quantile(q_high, dim="time", skipna=True)
-    vpd_high_threshold = dataset["vpd"].quantile(q_high, dim="time", skipna=True)
+    ppt_low_threshold = dataset["ppt"].quantile(q_low, dim="time", skipna=True).drop_vars("quantile", errors="ignore")
+    ppt_high_threshold = dataset["ppt"].quantile(q_high, dim="time", skipna=True).drop_vars("quantile", errors="ignore")
+    soil_low_threshold = dataset["soil"].quantile(q_low, dim="time", skipna=True).drop_vars("quantile", errors="ignore")
+    tmax_high_threshold = dataset["tmax"].quantile(q_high, dim="time", skipna=True).drop_vars("quantile", errors="ignore")
+    vpd_high_threshold = dataset["vpd"].quantile(q_high, dim="time", skipna=True).drop_vars("quantile", errors="ignore")
 
     dry_month_mask = dataset["ppt"] <= ppt_low_threshold
     wet_month_mask = dataset["ppt"] >= ppt_high_threshold
@@ -404,7 +404,7 @@ def sample_pseudo_absence_candidates(
         warnings.filterwarnings("ignore", message="All-NaN slice encountered", category=RuntimeWarning)
         warnings.filterwarnings("ignore", message="invalid value encountered in divide", category=RuntimeWarning)
         candidate_frame = candidate_grid.to_dataframe().reset_index()
-    candidate_frame = candidate_frame.dropna(how="all", subset=list(feature_dataset.data_vars))
+    candidate_frame = candidate_frame.dropna(how="all", subset=candidate_variables)
     candidate_frame = candidate_frame.rename(columns={"lat": "Latitude", "lon": "Longitude"})
     if candidate_frame.shape[0] > config.pseudo_absence_max_candidates:
         candidate_frame = candidate_frame.sample(
